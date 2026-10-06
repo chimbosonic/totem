@@ -128,6 +128,9 @@
       tickTimer: null,
       blockTimer: null,
       blockedUntil: 0,
+      // Bumped on lock, so a codes response that was in flight cannot
+      // unlock the page again.
+      generation: 0,
     };
     const serverNow = () => Date.now() + state.offsetMs;
 
@@ -140,6 +143,7 @@
     }
 
     function showLocked(message) {
+      state.generation += 1;
       clearTimers();
       state.unlocked = false;
       state.credentials = [];
@@ -248,15 +252,23 @@
     }
 
     async function loadCodes() {
+      const generation = state.generation;
+      const stale = () => generation !== state.generation;
       let response;
       try {
         response = await win.fetch("/api/codes", { cache: "no-store", credentials: "same-origin" });
       } catch {
+        if (stale()) {
+          return;
+        }
         if (state.unlocked) {
           retryLater("Cannot reach the server. Retrying.");
         } else {
           showLocked("Cannot reach the server.");
         }
+        return;
+      }
+      if (stale()) {
         return;
       }
       if (response.status === 401) {
@@ -269,6 +281,9 @@
         return;
       }
       const data = await response.json();
+      if (stale()) {
+        return;
+      }
       state.offsetMs = serverOffsetMs(data.generated_at, Date.now());
       state.credentials = data.credentials;
       view.codesMessage.textContent = "";
@@ -334,14 +349,17 @@
     }
 
     async function lock() {
+      // Lock the page now, not when the server answers.
+      showLocked("");
       try {
         await win.fetch("/api/lock", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "same-origin",
         });
-      } finally {
-        showLocked("");
+      } catch {
+        // The session may still be alive on the server until it times out.
+        view.unlockMessage.textContent = "Cannot reach the server. The session may stay open until it times out.";
       }
     }
 
