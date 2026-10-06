@@ -747,6 +747,115 @@ mod tests {
         h.shutdown().await;
     }
 
+    // Static file rules. The CSP (default-src 'self') would silently break
+    // anything inline, so check the files themselves.
+
+    const STATIC_FILES: [(&str, &str); 3] = [
+        ("index.html", INDEX_HTML),
+        ("app.js", APP_JS),
+        ("app.css", APP_CSS),
+    ];
+
+    /// Attribute names in `html` that start with `on`, like `onclick`.
+    fn inline_handlers(html: &str) -> Vec<String> {
+        let lower = html.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let mut found = Vec::new();
+        for (i, window) in bytes.windows(3).enumerate() {
+            if !(window[0].is_ascii_whitespace() && window[1] == b'o' && window[2] == b'n') {
+                continue;
+            }
+            let name: String = lower[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect();
+            if name.len() > 2 && lower[i + 1 + name.len()..].trim_start().starts_with('=') {
+                found.push(name);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn index_has_no_inline_script_style_or_handlers() {
+        let lower = INDEX_HTML.to_ascii_lowercase();
+        let mut rest = lower.as_str();
+        let mut scripts = 0;
+        while let Some(start) = rest.find("<script") {
+            let tag_end = rest[start..].find('>').unwrap() + start;
+            let tag = &rest[start..=tag_end];
+            assert!(tag.contains("src="), "inline script: {tag}");
+            assert!(
+                rest[tag_end + 1..].starts_with("</script>"),
+                "script has a body: {tag}"
+            );
+            scripts += 1;
+            rest = &rest[tag_end..];
+        }
+        assert_eq!(scripts, 1);
+        assert!(!lower.contains("<style"), "inline <style>");
+        assert!(!lower.contains(" style="), "style attribute");
+        assert_eq!(inline_handlers(INDEX_HTML), Vec::<String>::new());
+    }
+
+    #[test]
+    fn inline_handler_check_finds_handlers() {
+        assert_eq!(inline_handlers(r#"<a onclick="x()">"#), ["onclick"]);
+        assert_eq!(inline_handlers(r#"<b ONLOAD = 'x'>"#), ["onload"]);
+        assert!(inline_handlers(r#"<p class="once">on time</p>"#).is_empty());
+    }
+
+    #[test]
+    fn static_files_reference_no_external_urls() {
+        for (name, body) in STATIC_FILES {
+            let lower = body.to_ascii_lowercase();
+            for needle in [
+                "http://",
+                "https://",
+                "src=\"//",
+                "href=\"//",
+                "url(//",
+                "@import",
+            ] {
+                assert!(!lower.contains(needle), "{name} contains {needle}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_element_app_js_looks_up_exists_in_index() {
+        let mut ids = Vec::new();
+        let mut rest = APP_JS;
+        while let Some(start) = rest.find("getElementById(\"") {
+            let after = &rest[start + "getElementById(\"".len()..];
+            let end = after.find('"').unwrap();
+            ids.push(&after[..end]);
+            rest = &after[end..];
+        }
+        assert!(ids.len() >= 5, "app.js looks up {ids:?}");
+        for id in ids {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "index.html has no id {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_js_never_parses_strings_as_html_or_code() {
+        for banned in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+            "new Function",
+            "setAttribute(\"style\"",
+        ] {
+            assert!(!APP_JS.contains(banned), "app.js uses {banned}");
+        }
+    }
+
     // Every endpoint
 
     #[tokio::test]
