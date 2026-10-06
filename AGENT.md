@@ -21,6 +21,14 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - `cargo llvm-cov`: 0.9.1 installed (plus rustup `llvm-tools` component) for the coverage gate (section 14.3).
 - `libpcsclite` not available via pkg-config. On macOS the `pcsc` crate links against `PCSC.framework`, so local builds should still work. Linux CI and Docker need `libpcsclite-dev`.
 
+## Hardware available for integration tests
+
+- YubiKey NEO 3.4.9 (serial 4551023), interfaces OTP+FIDO+CCID, OATH applet version 1.0.0.
+- One credential: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user says it uses the RFC 6238 test setup.
+- OATH password protection is **disabled** (checked 2026-10-06 with `ykman oath info`). The service refuses to start against an unprotected applet (section 7), so a password must be set (`ykman oath access change`) before a full end-to-end run. Ask the user before changing anything on the key.
+- Hardware integration tests must not run in normal `cargo test` (section 14.1: no hardware in tests). Plan: put them in `tests/` behind an opt-in (a Cargo feature or env var), and compare with `ykman oath accounts code`.
+- The NEO's older applet may not support SHA512 credentials; do not assume it does in hardware tests.
+
 ## Build order progress (section 16)
 
 | # | Step | Status | Notes |
@@ -66,4 +74,5 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Read `PLAN.md`, checked toolchain, created this file.
 - 2026-10-06: Installed `llvm-tools` and `cargo-llvm-cov` 0.9.1.
 - 2026-10-06: Step 1 done. fmt, clippy, tests green. `logging.rs` line coverage 96%; crate total 88% (includes `main.rs`, to be excluded via `--ignore-filename-regex` in CI).
+- 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
