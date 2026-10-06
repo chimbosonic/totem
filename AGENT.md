@@ -25,7 +25,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 
 - YubiKey NEO 3.4.9 (serial 4551023), interfaces OTP+FIDO+CCID, OATH applet version 1.0.0.
 - One credential: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user confirmed it uses the RFC 6238 SHA-256 test secret `12345678901234567890123456789012` (ASCII, 32 bytes), so expected codes can be checked against the RFC 6238 Appendix B vectors as well as `ykman oath accounts code`. Verified 2026-10-06: SHA-256, **8 digits**, 30s period; `ykman` code matched an independent Python computation.
-- OATH password protection is **disabled** (checked 2026-10-06 with `ykman oath info`). The service refuses to start against an unprotected applet (section 7), so a password must be set (`ykman oath access change`) before a full end-to-end run. Ask the user before changing anything on the key.
+- OATH password protection was disabled at first; the user enabled it on 2026-10-06 and put the password in `.env` as `OATH_HW_PASSWORD` (git-ignored). Never print `.env` values; load it with `sh -c 'set -a; . ./.env; set +a; ...'`.
 - Hardware integration tests must not run in normal `cargo test` (section 14.1: no hardware in tests). Plan: put them in `tests/` behind an opt-in (a Cargo feature or env var), and compare with `ykman oath accounts code`.
 - The NEO's older applet may not support SHA512 credentials; do not assume it does in hardware tests.
 
@@ -36,6 +36,15 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
   - `cargo test --features hardware-tests --test hardware -- --test-threads=1` (unprotected key: 5 pass, the unlock test fails asking for `OATH_HW_PASSWORD`).
   - `OATH_HW_PASSWORD='...' cargo test --features hardware-tests --test hardware -- --test-threads=1` (protected key: unlock, wrong password, codes).
 - Coverage gate excludes `card/pcsc.rs` and `main.rs`: `cargo llvm-cov --ignore-filename-regex '(card/pcsc\.rs|main\.rs)$'`.
+
+## Manual hardware checklist (section 14.4) status
+
+1. Set OATH password: done by the user (2026-10-06).
+2. Add one 60s TOTP, one touch-required TOTP, one HOTP: **pending, user action** (only `RFC6238:sha256` exists now).
+3. Codes match `ykman oath accounts code`: done for `RFC6238:sha256` (`15566265` while unprotected; protected unlock path matches the RFC secret).
+4. PBKDF2 fixture: **pending, see Open questions** (do not commit a real-password fixture).
+5. Unplug and replug with the page open: **pending, user action** (needs step 13 frontend to be meaningful).
+6. Logs contain no password or codes: password checked absent from a real server run's log; codes covered by `logs_never_contain_password_key_session_id_or_codes`.
 
 ## Build order progress (section 16)
 
@@ -61,11 +70,11 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 ## Open questions and things to verify
 
 - ~~YKOATH bytes: confirm SELECT/CALCULATE ALL on the NEO and that APDUs without Le are accepted.~~ Resolved 2026-10-06: SELECT and CALCULATE ALL work on the NEO (applet 1.0.0) with no Le byte; the RFC6238:sha256 code read through our stack matched both an independent computation and `ykman` (`15566265`). VALIDATE and CALCULATE still need a password-protected key.
-- Which status word does the NEO return for a wrong VALIDATE? `hw_wrong_password_is_rejected` answers this once a password is set. Spec says `6984` (mapped to `WrongPassword`). `6A80` currently maps to a generic `Status` error. Needs a password set on the key to check.
+- ~~Which status word does the NEO return for a wrong VALIDATE?~~ Resolved 2026-10-06: **`6A80`**, not the spec's `6984`. This was a real bug (see Decisions); both now map to `WrongPassword` on VALIDATE. Spec says `6984` (mapped to `WrongPassword`). `6A80` currently maps to a generic `Status` error. Needs a password set on the key to check.
 - ~~Dropshot: which response types allow custom headers?~~ Resolved: `HttpResponseHeaders<T>::headers_mut()` (keeps typed OpenAPI) and `Response<Body>`.
 - ~~Dropshot: can `HttpError` carry `Retry-After` for 429?~~ Resolved: yes, `HttpError.headers` / `headers_mut()`; applied when rendered.
 - ~~Dropshot: `TypedBody` on non-JSON `Content-Type`?~~ Resolved: a missing `Content-Type` is treated as JSON, `application/*+json` is accepted, other types get 400. So POST handlers call `security::require_json` (400 too, for one consistent status).
-- PBKDF2 fixture from a real key is pending the manual hardware checklist (section 14.4).
+- PBKDF2 fixture from a real key (section 14.4 item 4): **do not commit a fixture derived from the real OATH password**. The derived key is all that is needed to unlock the applet, so it is as sensitive as the password. Either use a throwaway password set only for the capture, or skip this item (the crypto is already checked against independent Python vectors and the hardware unlock test). Ask the user.
 
 ## Decisions log
 
@@ -134,6 +143,8 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: `PcscCard::reconnect` drops the card handle, re-establishes the PC/SC context, and picks the reader again, because a replugged key can return under a new name and a restarted pcscd invalidates the context. pcsc's `Card` drop disconnects with `ResetCard` and `Transaction` drop ends with `LeaveCard`; both are fine since every operation reselects.
 - 2026-10-06: `main` does config, logger, PC/SC connect, startup check (exit 1 with the `ykman oath access change` hint if no password), then sessions, purger, rate limiter, and only then binds the port. It shuts down gracefully on SIGTERM (`docker stop`) or Ctrl-C via `HttpServer::wait_for_shutdown` / `close`. Added tokio `signal`.
 - 2026-10-06: Hardware tests live in `tests/hardware.rs` behind the `hardware-tests` feature (not `#[ignore]`, which section 14.1 restricts). They adapt to whether `OATH_HW_PASSWORD` is set; the unlock test panics with instructions when it is not, rather than silently passing.
+- 2026-10-06: **Bug found on hardware:** the NEO answers a wrong VALIDATE with `6A80`. It was mapped to `Protocol(Status(0x6A80))`, so a wrong password returned 503 and, worse, the unlock handler treated it as a card error and recorded no failure: wrong guesses bypassed the rate limiter. Fix: `status_error` maps both `6984` and `6A80` on VALIDATE to `WrongPassword` (ykman does the same). The mock now answers a wrong VALIDATE with `6A80` like the real key, which made 11 existing tests (including the API rate-limit and global-lockout tests) fail before the fix. Lesson: keep the mock faithful to real hardware, not just the spec.
+- 2026-10-06: `.env` is git-ignored; it holds `OATH_HW_PASSWORD` for hardware tests.
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
@@ -146,3 +157,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Step 10 done. 193 tests green, fmt and clippy clean. `ratelimit.rs` 100% line coverage; crate total 99%. Three tests had setup bugs (global limit too low for per-IP tests, one wrong clock step); fixed the tests, code unchanged.
 - 2026-10-06: Step 11 done. 255 tests green, fmt and clippy clean. Coverage 98.8% lines overall; every `api/*` file 100% except `server.rs` 98.9%. Read Dropshot 0.17.1 source to answer the section 9a questions (see Open questions and Decisions).
 - 2026-10-06: Step 12 done. 263 unit tests green, fmt and clippy clean (also with `--features hardware-tests`). Coverage with the pcsc/main exclusion: 99.0% lines. On the real NEO: connect, SELECT, reconnect, CALCULATE ALL (code matched ykman), and the no-password refusal all work. Unlock/VALIDATE on hardware waits for the user to set an OATH password.
+- 2026-10-06: With the key password-protected, all 6 hardware tests pass after fixing the `6A80` bug. Smoke-tested the real binary against the key with curl: healthz 200, wrong password 401 then 429 (`Retry-After: 1`), unlock 204 + cookie, codes OK, lock 204, codes after lock 401, SIGTERM exit 0, log free of the password.

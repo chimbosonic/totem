@@ -31,6 +31,7 @@ const TAG_TOUCH: u8 = 0x7C;
 const SW_OK: u16 = 0x9000;
 const SW_AUTH_REQUIRED: u16 = 0x6982;
 const SW_NO_SUCH_OBJECT: u16 = 0x6984;
+const SW_WRONG_DATA: u16 = 0x6A80;
 /// Upper bound on SEND REMAINING round trips for one command.
 const MAX_CHAIN: usize = 64;
 
@@ -65,7 +66,10 @@ pub enum ProtoError {
 /// Map a non-success status word to a typed error.
 pub fn status_error(command: Command, sw: u16) -> ProtoError {
     match (command, sw) {
-        (Command::Validate, SW_NO_SUCH_OBJECT) => ProtoError::WrongPassword,
+        // The spec lists 6984 for a wrong VALIDATE; a YubiKey NEO (applet
+        // 1.0.0) sends 6A80. ykman treats both as a wrong password, and so
+        // must we, or wrong guesses would not count against the rate limit.
+        (Command::Validate, SW_NO_SUCH_OBJECT | SW_WRONG_DATA) => ProtoError::WrongPassword,
         (_, SW_NO_SUCH_OBJECT) => ProtoError::NotFound,
         (_, SW_AUTH_REQUIRED) => ProtoError::AuthRequired,
         (_, other) => ProtoError::Status(other),
