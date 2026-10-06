@@ -1,5 +1,5 @@
 "use strict";
-// oath-web frontend. Plain JS, no build step, served from the binary.
+// totem frontend. Plain JS, no build step, served from the binary.
 //
 // The pure helpers at the top are unit tested with `node --test static/`.
 // `start` wires them to the page and only runs in a browser. Everything that

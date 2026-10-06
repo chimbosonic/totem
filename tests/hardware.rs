@@ -20,14 +20,14 @@
 
 use std::sync::Arc;
 
-use oath_web::card::pcsc::PcscCard;
-use oath_web::card::{OathCard, send};
-use oath_web::clock::{Clock, SystemClock};
-use oath_web::oath::crypto::{self, Algorithm};
-use oath_web::oath::proto::{self, Command};
-use oath_web::rng::OsChallengeSource;
-use oath_web::service::{CredentialState, Service, ServiceError};
-use oath_web::session::SessionStore;
+use totem::card::pcsc::PcscCard;
+use totem::card::{OathCard, send};
+use totem::clock::{Clock, SystemClock};
+use totem::oath::crypto::{self, Algorithm};
+use totem::oath::proto::{self, Command};
+use totem::rng::OsChallengeSource;
+use totem::service::{CredentialState, Service, ServiceError};
+use totem::session::SessionStore;
 use zeroize::Zeroizing;
 
 const SECRET: &[u8] = b"12345678901234567890123456789012";
@@ -214,7 +214,7 @@ fn hw_pbkdf2_matches_independent_fixture() {
 }
 
 /// Unlock with `OATH_HW_PASSWORD` and fetch every credential.
-async fn fetch_codes() -> oath_web::service::Codes {
+async fn fetch_codes() -> totem::service::Codes {
     let Some(password) = password() else {
         panic!("set OATH_HW_PASSWORD to the key's OATH password to run this test");
     };

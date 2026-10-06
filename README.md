@@ -1,8 +1,11 @@
-# oath-web
+# totem
 
-A small Rust service that reads TOTP codes from a YubiKey's OATH applet over
-PC/SC and shows them on an internal web page. Access is gated by the OATH
-password set on the key itself.
+A web front end for YubiKey features, run on the host the key is plugged into.
+Today it covers the OATH applet; more of the key's features are planned.
+
+The current release is a small Rust service that reads TOTP codes from a
+YubiKey's OATH applet over PC/SC and shows them on an internal web page.
+Access is gated by the OATH password set on the key itself.
 
 - Codes are computed on the YubiKey. The secrets never leave it.
 - One shared password: the key's OATH password. There are no user accounts.
@@ -21,7 +24,7 @@ Browser (LAN)
    |  HTTPS
 Reverse proxy (TLS, LAN allow-list)
    |  HTTP
-oath-web (one binary: API and web page)
+totem (one binary: API and web page)
    |  PC/SC
 pcscd
    |  USB CCID
@@ -87,11 +90,11 @@ startup with a message naming the variable.
 ## Container
 
 The image is built from the `Dockerfile` (Debian bookworm slim, runs as uid
-10001, about 35 MB). CI publishes it to `ghcr.io/<owner>/oath-web` for pushes
+10001, about 35 MB). CI publishes it to `ghcr.io/<owner>/totem` for pushes
 to `main` and for version tags.
 
 ```sh
-docker build -t oath-web:latest .
+docker build -t totem:latest .
 ```
 
 ### pcscd option A: host socket (default)
@@ -99,14 +102,14 @@ docker build -t oath-web:latest .
 The host runs `pcscd`; the container uses its socket.
 
 ```sh
-docker run -d --name oath-web --restart unless-stopped \
+docker run -d --name totem --restart unless-stopped \
   --read-only \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   -v /run/pcscd:/run/pcscd \
   -e OATH_TRUSTED_PROXIES=172.16.0.0/12 \
   --network <your proxy network> \
-  oath-web:latest
+  totem:latest
 ```
 
 - Do not publish a port (`-p`). Only the reverse proxy should reach the
@@ -128,7 +131,7 @@ Not shipped as an image yet. The outline:
 1. Stop `pcscd` on the host (`systemctl disable --now pcscd.socket pcscd`),
    since only one process can own the reader.
 2. Build a variant image that also installs `pcscd` and `tini`, and starts
-   `pcscd` before `oath-web` under `tini`.
+   `pcscd` before `totem` under `tini`.
 3. Pass the USB device through: `--device /dev/bus/usb:/dev/bus/usb`.
    `pcscd` needs write access to it, so the image cannot stay as locked down
    as option A.
@@ -189,7 +192,7 @@ the session ID. Tests check that none of the secrets appear in the logs.
 
 POST requests must send `Content-Type: application/json`. The session cookie
 is `HttpOnly; Secure; SameSite=Strict`. The full schema is in
-[`openapi/oath-web.json`](openapi/oath-web.json), generated from the code.
+[`openapi/totem.json`](openapi/totem.json), generated from the code.
 
 ## Development
 

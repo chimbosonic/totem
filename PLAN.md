@@ -1,8 +1,8 @@
-# Build Plan: `oath-web`
+# Build Plan: `totem`
 
 A small Rust service that reads TOTP codes from a YubiKey OATH applet plugged into the host and shows them on an internal web page. Access is gated by the OATH password set on the key.
 
-`oath-web` is a working name. Rename freely.
+The project is named `totem`. This plan covers its first remit, OATH (TOTP codes); later work will expose more YubiKey features over the web.
 
 ## 1. Goal and scope
 
@@ -41,7 +41,7 @@ Browser (LAN)
    |  HTTPS
 Traefik v3  (ipAllowList: LAN ranges)
    |  HTTP on internal Docker network
-oath-web container
+totem container
    |  PC/SC (pcsc crate -> libpcsclite)
 pcscd  (host, socket mounted into container)
    |  USB CCID
@@ -234,7 +234,7 @@ Dropshot deliberately has no middleware or "run on every request" hooks. Shared 
 
 **OpenAPI**
 
-- Generate the OpenAPI document from the API trait (`stub_api_description()` or equivalent) and commit it as `openapi/oath-web.json`.
+- Generate the OpenAPI document from the API trait (`stub_api_description()` or equivalent) and commit it as `openapi/totem.json`.
 - A test regenerates it and compares with `expectorate`, so API changes are always reviewed as a spec diff.
 
 **Logging**
@@ -301,8 +301,8 @@ Never log the password, derived key, raw session ID, or codes.
 
 ```yaml
 services:
-  oath-web:
-    image: oath-web:latest
+  totem:
+    image: totem:latest
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -428,7 +428,7 @@ The agent writes these tests before the corresponding code. The list is a minimu
 - Every endpoint in the API description returns the security headers (guards against a handler skipping the helper).
 - `require_session`, `client_ip`, and `acquire_unlock_attempt` have their own unit tests independent of endpoints.
 - `ServiceError` to `HttpError` mapping covers every variant.
-- Generated OpenAPI matches the committed `openapi/oath-web.json`.
+- Generated OpenAPI matches the committed `openapi/totem.json`.
 - Unpublished static endpoints do not appear in the OpenAPI document.
 
 ### 14.3 Coverage

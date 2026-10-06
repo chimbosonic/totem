@@ -6,23 +6,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use oath_web::api::server::{self, ApiContext};
-use oath_web::card::pcsc::PcscCard;
-use oath_web::clock::SystemClock;
-use oath_web::config::Config;
-use oath_web::ratelimit::RateLimiter;
-use oath_web::rng::OsChallengeSource;
-use oath_web::service::{Service, ServiceError};
-use oath_web::session::{self, SessionStore};
 use slog::{error, info};
+use totem::api::server::{self, ApiContext};
+use totem::card::pcsc::PcscCard;
+use totem::clock::SystemClock;
+use totem::config::Config;
+use totem::ratelimit::RateLimiter;
+use totem::rng::OsChallengeSource;
+use totem::service::{Service, ServiceError};
+use totem::session::{self, SessionStore};
 
 const PURGE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::from_env().context("invalid configuration")?);
-    let log = oath_web::logging::build_logger(std::io::stdout(), config.log_level);
-    info!(log, "oath-web starting"; "version" => env!("CARGO_PKG_VERSION"));
+    let log = totem::logging::build_logger(std::io::stdout(), config.log_level);
+    info!(log, "totem starting"; "version" => env!("CARGO_PKG_VERSION"));
 
     let card = match PcscCard::connect(config.reader.as_deref()) {
         Ok(card) => card,

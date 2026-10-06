@@ -228,7 +228,7 @@ pub fn openapi_json() -> String {
     let description = oath_api_mod::stub_api_description().expect("API description is valid");
     let version = dropshot::semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("crate version is semver");
-    let mut openapi = description.openapi("oath-web", version);
+    let mut openapi = description.openapi("totem", version);
     openapi.description("Read TOTP codes from a YubiKey OATH applet.");
     let value = openapi.json().expect("OpenAPI serialises");
     let mut out = serde_json::to_string_pretty(&value).expect("JSON serialises");
@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn openapi_matches_committed_document() {
-        expectorate::assert_contents("openapi/oath-web.json", &openapi_json());
+        expectorate::assert_contents("openapi/totem.json", &openapi_json());
     }
 
     #[test]

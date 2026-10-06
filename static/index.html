@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>oath-web</title>
+<title>totem</title>
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
 </head>
@@ -12,7 +12,7 @@
 <div class="wrap">
   <header>
     <div class="title">
-      <h1>oath-web</h1>
+      <h1>totem</h1>
       <div class="subtitle">TOTP codes from the YubiKey on this server</div>
     </div>
     <div class="badge"><span class="dot locked" id="state-dot"></span><span id="state-text">Locked</span></div>
@@ -24,7 +24,7 @@
     <section class="panel" id="locked-view">
       <div class="section-title">Unlock</div>
       <form class="lookup" id="unlock-form">
-        <input type="text" name="username" autocomplete="username" value="oath-web" hidden>
+        <input type="text" name="username" autocomplete="username" value="totem" hidden>
         <label class="k" for="password">OATH password</label>
         <input type="password" id="password" name="password" autocomplete="current-password" required>
         <button type="submit" id="unlock-button">Unlock</button>

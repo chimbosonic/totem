@@ -78,7 +78,7 @@ fn runtime_image_runs_as_non_root() {
         .parse()
         .expect("numeric uid, so Kubernetes-style runAsNonRoot checks work");
     assert!(uid >= 1000, "{user}");
-    assert!(runtime.contains("ENTRYPOINT [\"/usr/local/bin/oath-web\"]"));
+    assert!(runtime.contains("ENTRYPOINT [\"/usr/local/bin/totem\"]"));
 }
 
 #[test]

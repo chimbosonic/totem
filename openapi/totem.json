@@ -171,7 +171,7 @@
   },
   "info": {
     "description": "Read TOTP codes from a YubiKey OATH applet.",
-    "title": "oath-web",
+    "title": "totem",
     "version": "0.1.0"
   },
   "openapi": "3.0.3",
