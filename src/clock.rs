@@ -1,6 +1,7 @@
 //! Time source. No other module reads system time directly.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current time as whole seconds since the Unix epoch.
 pub trait Clock: Send + Sync {
@@ -13,7 +14,10 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> u64 {
-        0
+        // A clock set before 1970 is a broken host; treat it as the epoch.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
     }
 }
 
@@ -24,13 +28,19 @@ pub struct ManualClock {
 }
 
 impl ManualClock {
-    pub fn new(_start: u64) -> Self {
-        Self::default()
+    pub fn new(start: u64) -> Self {
+        Self {
+            now: AtomicU64::new(start),
+        }
     }
 
-    pub fn advance(&self, _secs: u64) {}
+    pub fn advance(&self, secs: u64) {
+        self.now.fetch_add(secs, Ordering::SeqCst);
+    }
 
-    pub fn set(&self, _secs: u64) {}
+    pub fn set(&self, secs: u64) {
+        self.now.store(secs, Ordering::SeqCst);
+    }
 }
 
 impl Clock for ManualClock {
