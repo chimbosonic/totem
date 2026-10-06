@@ -41,6 +41,8 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - Hardware tests (never part of plain `cargo test`):
   - `cargo test --features hardware-tests --test hardware -- --test-threads=1` (unprotected key: 5 pass, the unlock test fails asking for `OATH_HW_PASSWORD`).
   - `OATH_HW_PASSWORD='...' cargo test --features hardware-tests --test hardware -- --test-threads=1` (protected key: unlock, wrong password, codes).
+- Frontend tests: `node --test static/` (Node's built-in runner, no npm, no package.json).
+- Browser check (headless Chrome over CDP, script kept in the session scratchpad, not the repo): no CSP violations or JS errors in dark or light mode; screenshots looked right.
 - Coverage gate excludes `card/pcsc.rs` and `main.rs`: `cargo llvm-cov --ignore-filename-regex '(card/pcsc\.rs|main\.rs)$'`.
 
 ## Manual hardware checklist (section 14.4) status
@@ -49,7 +51,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 2. Add one 60s TOTP, one touch-required TOTP, one HOTP: done for 60s TOTP and HOTP; **touch-required is not supported by the NEO** (mock coverage only). Checked by `hw_sixty_second_totp_uses_its_own_timestep` and `hw_hotp_is_listed_without_a_code`.
 3. Codes match `ykman oath accounts code`: done for `RFC6238:sha256` (`15566265` while unprotected; protected unlock path matches the RFC secret).
 4. PBKDF2 fixture: done, kept in `.env` (`OATH_HW_DERIVED_KEY`), checked by `hw_pbkdf2_matches_independent_fixture`.
-5. Unplug and replug with the page open: **pending, user action** (needs step 13 frontend to be meaningful).
+5. Unplug and replug with the page open: **pending, user action**. The frontend now exists: unlock, unplug the key (expect "YubiKey unavailable. Is it plugged in? Retrying." every 5s), replug (codes return without unlocking again).
 6. Logs contain no password or codes: password checked absent from a real server run's log; codes covered by `logs_never_contain_password_key_session_id_or_codes`.
 
 ## Build order progress (section 16)
@@ -68,7 +70,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 10 | `ratelimit` | done | `RateLimiter::acquire` -> `UnlockPermit::{success, failure}`, `Denied`, `client_ip`, 26 tests |
 | 11 | `api` (Dropshot) | done | API trait (`api::definition`), handlers (`api::server`), `auth`, `security`, `errors`, OpenAPI snapshot, 55 tests (+7 session/service) |
 | 12 | Real PC/SC card implementation | done | `card::pcsc::PcscCard`, `card::pick_reader`, `main` wiring, `tests/hardware.rs` (feature `hardware-tests`); 8 unit tests + 6 hardware tests |
-| 13 | Frontend | todo | |
+| 13 | Frontend | done | `static/{index.html,app.js,app.css}`, 13 JS tests (`node --test static/`), 7 Rust static-file rule tests, repo-wide em dash test |
 | 14 | Dockerfile and compose | todo | |
 | 15 | GitLab CI with coverage gate | todo | |
 | 16 | README | todo | |
@@ -151,6 +153,11 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Hardware tests live in `tests/hardware.rs` behind the `hardware-tests` feature (not `#[ignore]`, which section 14.1 restricts). They adapt to whether `OATH_HW_PASSWORD` is set; the unlock test panics with instructions when it is not, rather than silently passing.
 - 2026-10-06: **Bug found on hardware:** the NEO answers a wrong VALIDATE with `6A80`. It was mapped to `Protocol(Status(0x6A80))`, so a wrong password returned 503 and, worse, the unlock handler treated it as a card error and recorded no failure: wrong guesses bypassed the rate limiter. Fix: `status_error` maps both `6984` and `6A80` on VALIDATE to `WrongPassword` (ykman does the same). The mock now answers a wrong VALIDATE with `6A80` like the real key, which made 11 existing tests (including the API rate-limit and global-lockout tests) fail before the fix. Lesson: keep the mock faithful to real hardware, not just the spec.
 - 2026-10-06: `.env` is git-ignored; it holds `OATH_HW_PASSWORD` for hardware tests.
+- 2026-10-06: Frontend is vanilla JS, as PLAN.md section 10 says (user considered htmx and chose vanilla). It is tested with `node --test` (user's choice): pure helpers in `static/app.js` are exported via `module.exports` only under Node; in a browser the file is a classic deferred script. `static/app.test.js` is not served (only the three files are `include_str!`'d). CI needs a Node job for it (step 15).
+- 2026-10-06: Visual style copies dane.dp42.dev at the user's request: its palette and light-mode palette, monospace everywhere, 16px panels, pills, gradient pill buttons, dashed value boxes. This overrides PLAN.md section 10's "clear sans-serif for labels".
+- 2026-10-06: Frontend behaviour: on load it fetches `/api/codes` (401 means locked view, 200 unlocked, 503 unlocked with a retrying message every 5s). The countdown uses the server clock (offset from `generated_at`); it refetches 500ms after the soonest `valid_until`, never more often than 1s, and again when the tab becomes visible. A 429 disables the unlock button with a live countdown from `Retry-After`. The password field is cleared before the request. Copy uses `navigator.clipboard` (needs HTTPS or localhost). Codes are shown in groups of three from the left (`123 456 78` for 8 digits), as the plan says.
+- 2026-10-06: CSP safety rules for the static files are enforced by Rust tests: no inline scripts or `<style>`, no `style=` or `on*=` attributes, no external URLs (even in comments), no `innerHTML`/`eval`/`new Function` in app.js, and every `getElementById("...")` id must exist in index.html. The countdown bar is driven by CSSOM `style.transform`, which the CSP allows. A repo-wide test (`tests/repo_rules.rs`) enforces the no em dash rule.
+- 2026-10-06: Known, accepted: browsers request `/favicon.ico`, which is a Dropshot 404 (no security headers, no content). A `data:` favicon would violate the CSP; serving a real icon would mean another endpoint. Revisit only if wanted.
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
@@ -167,3 +174,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Added `hw_pbkdf2_matches_independent_fixture`; fixture computed into `.env` without printing it. All 7 hardware tests pass.
 - 2026-10-06: User added a 60s TOTP and an HOTP (touch unsupported on the NEO). Added two hardware tests; all 9 pass. Every YKOATH command we use (SELECT, VALIDATE, CALCULATE ALL, CALCULATE) is now verified on the real key.
 - 2026-10-06: HOTP counter confirmed untouched by the service (`755224` on first manual read). Counter is now 1.
+- 2026-10-06: Step 13 done. 269 Rust tests and 13 JS tests green, fmt and clippy clean. Checked in headless Chrome against the real key: both views render in dark and light mode, codes and countdown work, no CSP violations.

@@ -2,11 +2,48 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>oath-web</title>
 <link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
 </head>
 <body>
-<main id="app">oath-web</main>
-<script src="/app.js"></script>
+<div class="wrap">
+  <header>
+    <div class="title">
+      <h1>oath-web</h1>
+      <div class="subtitle">TOTP codes from the YubiKey on this server</div>
+    </div>
+    <div class="badge"><span class="dot locked" id="state-dot"></span><span id="state-text">Locked</span></div>
+  </header>
+
+  <noscript><div class="panel">This page needs JavaScript.</div></noscript>
+
+  <main>
+    <section class="panel" id="locked-view">
+      <div class="section-title">Unlock</div>
+      <form class="lookup" id="unlock-form">
+        <input type="text" name="username" autocomplete="username" value="oath-web" hidden>
+        <label class="k" for="password">OATH password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
+        <button type="submit" id="unlock-button">Unlock</button>
+      </form>
+      <p class="message" id="unlock-message" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="unlocked-view" hidden>
+      <div class="toolbar">
+        <p class="message" id="codes-message" role="status" aria-live="polite"></p>
+        <button type="button" id="lock-button">Lock</button>
+      </div>
+      <div class="grid" id="codes"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span class="note">Codes are computed on the YubiKey. Its secrets never leave it.</span>
+  </footer>
+</div>
 </body>
 </html>

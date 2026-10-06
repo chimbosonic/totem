@@ -799,6 +799,14 @@ mod tests {
     }
 
     #[test]
+    fn unlock_form_supports_password_managers() {
+        // Browsers and password managers expect a username next to a
+        // password; a fixed, hidden one keeps them from guessing.
+        assert!(INDEX_HTML.contains(r#"autocomplete="username""#));
+        assert!(INDEX_HTML.contains(r#"autocomplete="current-password""#));
+    }
+
+    #[test]
     fn inline_handler_check_finds_handlers() {
         assert_eq!(inline_handlers(r#"<a onclick="x()">"#), ["onclick"]);
         assert_eq!(inline_handlers(r#"<b ONLOAD = 'x'>"#), ["onload"]);
