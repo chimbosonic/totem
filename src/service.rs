@@ -97,7 +97,7 @@ impl Service {
 
     /// Whether the card is reachable and still password protected.
     pub async fn health(&self) -> Result<(), ServiceError> {
-        todo!()
+        self.startup_check().await.map(|_| ())
     }
 
     /// Check `password` against the card and return the derived key.
@@ -114,10 +114,10 @@ impl Service {
     }
 
     /// Unlock the card with the session's key and list every credential.
-    pub async fn codes(&self, _session: &AuthedSession) -> Result<Codes, ServiceError> {
+    pub async fn codes(&self, session: &AuthedSession) -> Result<Codes, ServiceError> {
         let now = self.clock.now();
         let rng = self.rng.clone();
-        let key: DerivedKey = todo!();
+        let key = session.key().clone();
         let credentials = self
             .run(move |tx| {
                 if open(tx, rng.as_ref(), |_| key.clone())?.is_none() {

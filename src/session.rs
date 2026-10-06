@@ -81,8 +81,10 @@ impl AuthedSession {
 }
 
 impl fmt::Debug for AuthedSession {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthedSession")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -147,8 +149,9 @@ impl SessionStore {
     }
 
     /// Like [`touch`](Self::touch), but returns proof of the live session.
-    pub fn authenticate(&self, _id: SessionId) -> Option<AuthedSession> {
-        todo!()
+    pub fn authenticate(&self, id: SessionId) -> Option<AuthedSession> {
+        let key = self.touch(&id)?;
+        Some(AuthedSession { id, key })
     }
 
     /// Delete a session. Returns whether it existed.
