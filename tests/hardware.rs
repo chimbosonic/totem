@@ -212,3 +212,63 @@ fn hw_pbkdf2_matches_independent_fixture() {
         "derived key does not match OATH_HW_DERIVED_KEY"
     );
 }
+
+/// Unlock with `OATH_HW_PASSWORD` and fetch every credential.
+async fn fetch_codes() -> oath_web::service::Codes {
+    let Some(password) = password() else {
+        panic!("set OATH_HW_PASSWORD to the key's OATH password to run this test");
+    };
+    let svc = service();
+    let key = svc.unlock(Zeroizing::new(password)).await.expect("unlock");
+    let store = SessionStore::new(
+        Arc::new(SystemClock),
+        Arc::new(OsChallengeSource),
+        300,
+        1800,
+    );
+    let session = store.authenticate(store.create(key)).unwrap();
+    svc.codes(&session).await.expect("codes")
+}
+
+/// Needs `60/RFC6238:sha256-60s` (same secret, SHA-256, 8 digits, 60s).
+#[tokio::test]
+async fn hw_sixty_second_totp_uses_its_own_timestep() {
+    let codes = fetch_codes().await;
+    let credential = codes
+        .credentials
+        .iter()
+        .find(|c| c.issuer == "RFC6238" && c.account == "sha256-60s")
+        .expect("60/RFC6238:sha256-60s credential on the key");
+    let CredentialState::Ok {
+        code,
+        digits,
+        period,
+        valid_from,
+        valid_until,
+    } = &credential.state
+    else {
+        panic!("expected a code, got {:?}", credential.state);
+    };
+    assert_eq!(*period, 60);
+    assert_eq!(valid_from % 60, 0);
+    assert_eq!(valid_until - valid_from, 60);
+
+    let step = codes.generated_at / 60;
+    let mac = crypto::hmac(Algorithm::Sha256, SECRET, &step.to_be_bytes());
+    let expected = crypto::format_code(*digits, crypto::dynamic_truncate(&mac));
+    assert_eq!(code, &expected, "at t={}", codes.generated_at);
+}
+
+/// Needs `RFC4226:sha1` (HOTP). Listed, never computed, so its counter is
+/// not advanced. Confirm the counter by hand with `ykman oath accounts code
+/// RFC4226`: the first code ever generated should be 755224 (counter 0).
+#[tokio::test]
+async fn hw_hotp_is_listed_without_a_code() {
+    let codes = fetch_codes().await;
+    let credential = codes
+        .credentials
+        .iter()
+        .find(|c| c.issuer == "RFC4226" && c.account == "sha1")
+        .expect("RFC4226:sha1 HOTP credential on the key");
+    assert_eq!(credential.state, CredentialState::Hotp);
+}

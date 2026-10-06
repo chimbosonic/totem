@@ -24,7 +24,12 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 ## Hardware available for integration tests
 
 - YubiKey NEO 3.4.9 (serial 4551023), interfaces OTP+FIDO+CCID, OATH applet version 1.0.0.
-- One credential: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user confirmed it uses the RFC 6238 SHA-256 test secret `12345678901234567890123456789012` (ASCII, 32 bytes), so expected codes can be checked against the RFC 6238 Appendix B vectors as well as `ykman oath accounts code`. Verified 2026-10-06: SHA-256, **8 digits**, 30s period; `ykman` code matched an independent Python computation.
+- Credentials (as of 2026-10-06):
+  - `RFC6238:sha256`: TOTP, SHA-256, 8 digits, 30s, RFC 6238 SHA-256 secret.
+  - `60/RFC6238:sha256-60s`: same secret, SHA-256, 8 digits, **60s**.
+  - `RFC4226:sha1`: **HOTP**, SHA-1, 6 digits, RFC 4226 secret `12345678901234567890` (base32 `GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ`). Counter should still be 0: the first code ever generated must be `755224`.
+  - Touch-required: **not possible on this key**. `ykman` says "Require touch is not supported on this YubiKey" (the NEO's OATH applet is 1.0.0; touch needs a YubiKey 4.2.4 or newer). Touch handling is covered by the mock only.
+- Original credential note: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user confirmed it uses the RFC 6238 SHA-256 test secret `12345678901234567890123456789012` (ASCII, 32 bytes), so expected codes can be checked against the RFC 6238 Appendix B vectors as well as `ykman oath accounts code`. Verified 2026-10-06: SHA-256, **8 digits**, 30s period; `ykman` code matched an independent Python computation.
 - Device ID (PBKDF2 salt, not secret): `4d17581a446ffed1`.
 - OATH password protection was disabled at first; the user enabled it on 2026-10-06 and put the password in `.env` as `OATH_HW_PASSWORD` (git-ignored). Never print `.env` values; load it with `sh -c 'set -a; . ./.env; set +a; ...'`.
 - Hardware integration tests must not run in normal `cargo test` (section 14.1: no hardware in tests). Plan: put them in `tests/` behind an opt-in (a Cargo feature or env var), and compare with `ykman oath accounts code`.
@@ -41,7 +46,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 ## Manual hardware checklist (section 14.4) status
 
 1. Set OATH password: done by the user (2026-10-06).
-2. Add one 60s TOTP, one touch-required TOTP, one HOTP: **pending, user action** (only `RFC6238:sha256` exists now).
+2. Add one 60s TOTP, one touch-required TOTP, one HOTP: done for 60s TOTP and HOTP; **touch-required is not supported by the NEO** (mock coverage only). Checked by `hw_sixty_second_totp_uses_its_own_timestep` and `hw_hotp_is_listed_without_a_code`.
 3. Codes match `ykman oath accounts code`: done for `RFC6238:sha256` (`15566265` while unprotected; protected unlock path matches the RFC secret).
 4. PBKDF2 fixture: done, kept in `.env` (`OATH_HW_DERIVED_KEY`), checked by `hw_pbkdf2_matches_independent_fixture`.
 5. Unplug and replug with the page open: **pending, user action** (needs step 13 frontend to be meaningful).
@@ -70,7 +75,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 
 ## Open questions and things to verify
 
-- ~~YKOATH bytes: confirm SELECT/CALCULATE ALL on the NEO and that APDUs without Le are accepted.~~ Resolved 2026-10-06: SELECT and CALCULATE ALL work on the NEO (applet 1.0.0) with no Le byte; the RFC6238:sha256 code read through our stack matched both an independent computation and `ykman` (`15566265`). VALIDATE and CALCULATE still need a password-protected key.
+- ~~YKOATH bytes: confirm SELECT/CALCULATE ALL on the NEO and that APDUs without Le are accepted.~~ Resolved 2026-10-06: SELECT and CALCULATE ALL work on the NEO (applet 1.0.0) with no Le byte; the RFC6238:sha256 code read through our stack matched both an independent computation and `ykman` (`15566265`). VALIDATE (with the `6A80` finding) and CALCULATE (60s credential) were then confirmed on the protected key.
 - ~~Which status word does the NEO return for a wrong VALIDATE?~~ Resolved 2026-10-06: **`6A80`**, not the spec's `6984`. This was a real bug (see Decisions); both now map to `WrongPassword` on VALIDATE. Spec says `6984` (mapped to `WrongPassword`). `6A80` currently maps to a generic `Status` error. Needs a password set on the key to check.
 - ~~Dropshot: which response types allow custom headers?~~ Resolved: `HttpResponseHeaders<T>::headers_mut()` (keeps typed OpenAPI) and `Response<Body>`.
 - ~~Dropshot: can `HttpError` carry `Retry-After` for 429?~~ Resolved: yes, `HttpError.headers` / `headers_mut()`; applied when rendered.
@@ -160,3 +165,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Step 12 done. 263 unit tests green, fmt and clippy clean (also with `--features hardware-tests`). Coverage with the pcsc/main exclusion: 99.0% lines. On the real NEO: connect, SELECT, reconnect, CALCULATE ALL (code matched ykman), and the no-password refusal all work. Unlock/VALIDATE on hardware waits for the user to set an OATH password.
 - 2026-10-06: With the key password-protected, all 6 hardware tests pass after fixing the `6A80` bug. Smoke-tested the real binary against the key with curl: healthz 200, wrong password 401 then 429 (`Retry-After: 1`), unlock 204 + cookie, codes OK, lock 204, codes after lock 401, SIGTERM exit 0, log free of the password.
 - 2026-10-06: Added `hw_pbkdf2_matches_independent_fixture`; fixture computed into `.env` without printing it. All 7 hardware tests pass.
+- 2026-10-06: User added a 60s TOTP and an HOTP (touch unsupported on the NEO). Added two hardware tests; all 9 pass. Every YKOATH command we use (SELECT, VALIDATE, CALCULATE ALL, CALCULATE) is now verified on the real key.
