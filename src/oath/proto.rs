@@ -274,10 +274,9 @@ pub struct CalculatedEntry {
 
 pub fn parse_calculate_all(data: &[u8]) -> Result<Vec<CalculatedEntry>, ProtoError> {
     let items = tlv::parse_all(data)?;
-    let mut pairs = items.chunks_exact(2);
-    let mut entries = Vec::with_capacity(items.len() / 2);
-    for pair in &mut pairs {
-        let (name, result) = (pair[0], pair[1]);
+    let (pairs, rest) = items.as_chunks::<2>();
+    let mut entries = Vec::with_capacity(pairs.len());
+    for &[name, result] in pairs {
         if name.tag != TAG_NAME {
             return Err(ProtoError::Malformed("CALCULATE ALL entry without name"));
         }
@@ -296,7 +295,7 @@ pub fn parse_calculate_all(data: &[u8]) -> Result<Vec<CalculatedEntry>, ProtoErr
             state,
         });
     }
-    if !pairs.remainder().is_empty() {
+    if !rest.is_empty() {
         return Err(ProtoError::Malformed("CALCULATE ALL name without result"));
     }
     Ok(entries)
