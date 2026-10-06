@@ -54,7 +54,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 2. Add one 60s TOTP, one touch-required TOTP, one HOTP: done for 60s TOTP and HOTP; **touch-required is not supported by the NEO** (mock coverage only). Checked by `hw_sixty_second_totp_uses_its_own_timestep` and `hw_hotp_is_listed_without_a_code`.
 3. Codes match `ykman oath accounts code`: done for `RFC6238:sha256` (`15566265` while unprotected; protected unlock path matches the RFC secret).
 4. PBKDF2 fixture: done, kept in `.env` (`OATH_HW_DERIVED_KEY`), checked by `hw_pbkdf2_matches_independent_fixture`.
-5. Unplug and replug with the page open: **pending, user action**. The frontend now exists: unlock, unplug the key (expect "YubiKey unavailable. Is it plugged in? Retrying." every 5s), replug (codes return without unlocking again).
+5. Unplug and replug with the page open: done by the user on 2026-10-06; it works (page reports the key unavailable, then recovers on replug without unlocking again).
 6. Logs contain no password or codes: password checked absent from a real server run's log; codes covered by `logs_never_contain_password_key_session_id_or_codes`.
 
 ## Build order progress (section 16)
@@ -194,3 +194,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Built the image with Rancher Desktop (Docker 29.5.3, linux/aarch64): 1.5 min cold build, 34.5 MB image, runs as uid 10001, ships `libpcsclite1 1.9.9-2` and `ca-certificates` only (no curl). Run with `--read-only --cap-drop ALL --security-opt no-new-privileges:true` it logs JSON and exits 1 with the "no usable smart card reader" hint, as expected without pcscd. `docker compose config` validated the compose file (since removed). Step 14 done.
 - 2026-10-06: Step 15 done: GitHub Actions workflow, actionlint clean, every command passes locally (277 Rust tests, 13 JS, 7 gate tests, coverage gate passes). Not run on GitHub yet: there is no remote.
 - 2026-10-06: Step 16 done. All 16 build steps complete. 275 Rust tests, 13 JS tests, 7 gate tests, 9 hardware tests (opt-in) green.
+- 2026-10-06: User confirmed manual checklist item 5 (unplug and replug) works. All six section 14.4 items are now done or explained (touch-required is not supported by the NEO).
