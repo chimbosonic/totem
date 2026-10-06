@@ -35,7 +35,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 |---|---|---|---|
 | 1 | Scaffold crate, forbid unsafe, logging, placeholder test | done | `logging::build_logger` (slog-json + slog-async), 2 tests |
 | 2 | `clock` and `rng` traits | done | `Clock` (`SystemClock`, `ManualClock`), `ChallengeSource` (`OsChallengeSource`, `SequentialChallengeSource`), 11 tests |
-| 3 | `config` | todo | |
+| 3 | `config` | done | `Config::from_lookup` (tested) and `from_env` (thin wrapper), 15 tests; `main` uses it |
 | 4 | `oath::tlv` | todo | |
 | 5 | `oath::crypto` | todo | |
 | 6 | `oath::proto` | todo | |
@@ -74,5 +74,9 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Read `PLAN.md`, checked toolchain, created this file.
 - 2026-10-06: Installed `llvm-tools` and `cargo-llvm-cov` 0.9.1.
 - 2026-10-06: Step 1 done. fmt, clippy, tests green. `logging.rs` line coverage 96%; crate total 88% (includes `main.rs`, to be excluded via `--ignore-filename-regex` in CI).
+- 2026-10-06: Config parses through a lookup closure (`Config::from_lookup`). Edition 2024 makes `std::env::set_var` unsafe and we forbid unsafe, so tests pass a map instead of touching the process env. `from_env` is the only uncovered part of `config.rs`.
+- 2026-10-06: Config leniency: values are trimmed; empty `OATH_READER` means unset; `OATH_TRUSTED_PROXIES` accepts bare IPs as /32 or /128 and skips empty entries; `OATH_LOG_LEVEL` is case-insensitive and also accepts `warn`. TTLs and the fail limit must be at least 1; idle equal to max is allowed.
+- 2026-10-06: Added `thiserror` 2 and `ipnet` 2 (CIDR parsing).
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
+- 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.

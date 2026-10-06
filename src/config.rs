@@ -45,9 +45,106 @@ impl Config {
 
     /// Read configuration through `lookup`, which returns a variable's value
     /// or `None` if it is unset.
-    pub fn from_lookup(_lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let _ = IpAddr::from([0, 0, 0, 0]);
-        todo!()
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let get = |var: &str| lookup(var).map(|v| v.trim().to_owned());
+
+        let bind = match get("OATH_BIND") {
+            None => SocketAddr::from(([0, 0, 0, 0], 8080)),
+            Some(v) => v
+                .parse()
+                .map_err(|_| invalid("OATH_BIND", &v, "expected an address like 0.0.0.0:8080"))?,
+        };
+        let reader = get("OATH_READER").filter(|v| !v.is_empty());
+        let session_idle_secs = positive(get, "OATH_SESSION_IDLE_SECS", 300)?;
+        let session_max_secs = positive(get, "OATH_SESSION_MAX_SECS", 1800)?;
+        if session_idle_secs > session_max_secs {
+            return Err(ConfigError::IdleExceedsMax {
+                idle: session_idle_secs,
+                max: session_max_secs,
+            });
+        }
+        let global_fail_limit = positive(get, "OATH_GLOBAL_FAIL_LIMIT", 20)?;
+        let trusted_proxies = match get("OATH_TRUSTED_PROXIES") {
+            None => Vec::new(),
+            Some(v) => parse_proxies(&v)?,
+        };
+        let log_level = match get("OATH_LOG_LEVEL") {
+            None => Level::Info,
+            Some(v) => parse_level(&v)?,
+        };
+
+        Ok(Self {
+            bind,
+            reader,
+            session_idle_secs,
+            session_max_secs,
+            global_fail_limit,
+            trusted_proxies,
+            log_level,
+        })
+    }
+}
+
+fn invalid(var: &'static str, value: &str, reason: &'static str) -> ConfigError {
+    ConfigError::Invalid {
+        var,
+        value: value.to_owned(),
+        reason,
+    }
+}
+
+/// Parse an unsigned integer that must be at least 1.
+fn positive<T>(
+    get: impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    default: T,
+) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + PartialEq + From<u8>,
+{
+    let Some(v) = get(var) else {
+        return Ok(default);
+    };
+    match v.parse::<T>() {
+        Ok(n) if n != T::from(0) => Ok(n),
+        _ => Err(invalid(var, &v, "expected a whole number of at least 1")),
+    }
+}
+
+/// Comma-separated CIDRs. A bare address means that single host.
+fn parse_proxies(value: &str) -> Result<Vec<IpNet>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<IpNet>()
+                .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+                .map_err(|_| {
+                    invalid(
+                        "OATH_TRUSTED_PROXIES",
+                        value,
+                        "expected comma-separated CIDRs like 172.16.0.0/12",
+                    )
+                })
+        })
+        .collect()
+}
+
+fn parse_level(value: &str) -> Result<Level, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "trace" => Ok(Level::Trace),
+        "debug" => Ok(Level::Debug),
+        "info" => Ok(Level::Info),
+        "warning" | "warn" => Ok(Level::Warning),
+        "error" => Ok(Level::Error),
+        "critical" => Ok(Level::Critical),
+        _ => Err(invalid(
+            "OATH_LOG_LEVEL",
+            value,
+            "expected one of trace, debug, info, warning, error, critical",
+        )),
     }
 }
 
