@@ -9,10 +9,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-use crate::card::{CardError, OathCard};
+use crate::card::{self, CardError, CardTransaction, OathCard};
 use crate::clock::Clock;
-use crate::oath::crypto::DerivedKey;
-use crate::oath::proto::ProtoError;
+use crate::oath::crypto::{self, DerivedKey};
+use crate::oath::proto::{self, Command, EntryState, ProtoError, SelectResponse};
 use crate::rng::ChallengeSource;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -23,12 +23,9 @@ pub enum ServiceError {
     NoPassword,
     #[error("card failed to prove it holds the OATH key")]
     CardAuthFailed,
-    #[error("card unavailable: {source}")]
-    Unavailable {
-        source: CardError,
-        /// Whether a reconnect was attempted before giving up.
-        reconnected: bool,
-    },
+    /// The card stayed unreachable after one reconnect and retry.
+    #[error("card unavailable: {0}")]
+    Unavailable(CardError),
     #[error("card protocol error: {0}")]
     Protocol(ProtoError),
     #[error("internal error running card operation")]
@@ -88,20 +85,151 @@ impl Service {
 
     /// SELECT the applet and refuse to continue if it has no password.
     pub async fn startup_check(&self) -> Result<CardInfo, ServiceError> {
-        let _ = (&self.card, &self.clock, &self.rng);
-        todo!()
+        let select = self.run(select).await?;
+        if select.auth.is_none() {
+            return Err(ServiceError::NoPassword);
+        }
+        Ok(CardInfo {
+            version: select.version,
+        })
     }
 
     /// Check `password` against the card and return the derived key.
     /// The password is wiped when this returns.
-    pub async fn unlock(&self, _password: Zeroizing<String>) -> Result<DerivedKey, ServiceError> {
-        todo!()
+    pub async fn unlock(&self, password: Zeroizing<String>) -> Result<DerivedKey, ServiceError> {
+        let rng = self.rng.clone();
+        self.run(move |tx| {
+            open(tx, rng.as_ref(), |device_id| {
+                crypto::derive_key(&password, device_id)
+            })
+        })
+        .await?
+        .ok_or(ServiceError::NoPassword)
     }
 
     /// Unlock the card with `key` and list every credential.
-    pub async fn codes(&self, _key: &DerivedKey) -> Result<Codes, ServiceError> {
-        todo!()
+    pub async fn codes(&self, key: &DerivedKey) -> Result<Codes, ServiceError> {
+        let now = self.clock.now();
+        let rng = self.rng.clone();
+        let key = key.clone();
+        let credentials = self
+            .run(move |tx| {
+                if open(tx, rng.as_ref(), |_| key.clone())?.is_none() {
+                    return Ok(None);
+                }
+                list(tx, now).map(Some)
+            })
+            .await?
+            .ok_or(ServiceError::NoPassword)?;
+        Ok(Codes {
+            generated_at: now,
+            credentials,
+        })
     }
+
+    /// Run `op` in one card transaction on the blocking pool, with at most
+    /// one reconnect and retry.
+    async fn run<T, F>(&self, op: F) -> Result<T, ServiceError>
+    where
+        T: Send + 'static,
+        F: Fn(&mut dyn CardTransaction) -> Result<T, CardError> + Send + 'static,
+    {
+        let mut card = self.card.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || with_retry(card.as_mut(), &op))
+            .await
+            .map_err(|_| ServiceError::Internal)?
+    }
+}
+
+fn with_retry<T>(
+    card: &mut dyn OathCard,
+    op: &dyn Fn(&mut dyn CardTransaction) -> Result<T, CardError>,
+) -> Result<T, ServiceError> {
+    let attempt = |card: &mut dyn OathCard| card.transaction().and_then(|mut tx| op(&mut *tx));
+    let result = match attempt(card) {
+        Err(e) if e.needs_reconnect() => card.reconnect().and_then(|()| attempt(card)),
+        other => other,
+    };
+    result.map_err(|e| classify(card, e))
+}
+
+/// Map the final card error of an operation to a service error.
+fn classify(card: &mut dyn OathCard, error: CardError) -> ServiceError {
+    match error {
+        CardError::Proto(ProtoError::WrongPassword) => ServiceError::WrongPassword,
+        CardError::Proto(ProtoError::CardAuthFailed) => {
+            // Never keep talking to a card that failed to prove itself.
+            let _ = card.reconnect();
+            ServiceError::CardAuthFailed
+        }
+        CardError::Proto(other) => ServiceError::Protocol(other),
+        // Only reached after the reconnect and retry in `with_retry`.
+        transport => ServiceError::Unavailable(transport),
+    }
+}
+
+fn select(tx: &mut dyn CardTransaction) -> Result<SelectResponse, CardError> {
+    let data = card::send(tx, &proto::select_apdu(), Command::Select)?;
+    Ok(proto::parse_select(&data)?)
+}
+
+/// SELECT, then VALIDATE with the key `derive` builds from the device ID.
+/// `None` if the applet has no password.
+fn open(
+    tx: &mut dyn CardTransaction,
+    rng: &dyn ChallengeSource,
+    derive: impl FnOnce(&[u8]) -> DerivedKey,
+) -> Result<Option<DerivedKey>, CardError> {
+    let selected = select(tx)?;
+    let Some(auth) = selected.auth else {
+        return Ok(None);
+    };
+    let key = derive(&selected.device_id);
+    let ours = rng.challenge();
+    let apdu = proto::validate_apdu(auth.algorithm, key.as_ref(), &auth.challenge, &ours);
+    let data = card::send(tx, &apdu, Command::Validate)?;
+    proto::verify_validate_response(&data, auth.algorithm, key.as_ref(), &ours)?;
+    Ok(Some(key))
+}
+
+/// CALCULATE ALL at the 30s timestep, then CALCULATE any credential with a
+/// different period at its own timestep.
+fn list(tx: &mut dyn CardTransaction, now: u64) -> Result<Vec<Credential>, CardError> {
+    let default_step = crypto::timestep(now, proto::DEFAULT_PERIOD);
+    let data = card::send(
+        tx,
+        &proto::calculate_all_apdu(default_step),
+        Command::CalculateAll,
+    )?;
+    let mut out = Vec::new();
+    for entry in proto::parse_calculate_all(&data)? {
+        let name = proto::parse_name(&entry.name);
+        let state = match entry.state {
+            EntryState::Hotp => CredentialState::Hotp,
+            EntryState::TouchRequired => CredentialState::TouchRequired,
+            EntryState::Code(mut code) => {
+                if name.period != proto::DEFAULT_PERIOD {
+                    let step = crypto::timestep(now, name.period);
+                    let apdu = proto::calculate_apdu(&entry.name, step);
+                    code = proto::parse_calculate(&card::send(tx, &apdu, Command::Calculate)?)?;
+                }
+                let (valid_from, valid_until) = crypto::validity_window(now, name.period);
+                CredentialState::Ok {
+                    code: code.to_code(),
+                    digits: code.digits,
+                    period: name.period.get(),
+                    valid_from,
+                    valid_until,
+                }
+            }
+        };
+        out.push(Credential {
+            issuer: name.issuer,
+            account: name.account,
+            state,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -375,10 +503,7 @@ mod tests {
         card.fail_next(100, MockFault::Removed);
         assert_eq!(
             service(&card, 59).codes(&key()).await,
-            Err(ServiceError::Unavailable {
-                source: CardError::Removed,
-                reconnected: true,
-            })
+            Err(ServiceError::Unavailable(CardError::Removed))
         );
         let events = card.events();
         assert_eq!(count(&events, &MockEvent::Reconnect), 1);
@@ -391,6 +516,16 @@ mod tests {
         card.fail_next(1, MockFault::Reset);
         assert!(service(&card, 59).unlock(password(PASSWORD)).await.is_ok());
         assert_eq!(count(&card.events(), &MockEvent::Reconnect), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_password_on_retry_is_still_wrong_password() {
+        let card = rfc_card();
+        card.fail_next(1, MockFault::Reset);
+        assert_eq!(
+            service(&card, 59).unlock(password("wrong")).await,
+            Err(ServiceError::WrongPassword)
+        );
     }
 
     #[tokio::test]

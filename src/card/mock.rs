@@ -89,6 +89,7 @@ struct State {
     key: Option<DerivedKey>,
     credentials: Vec<MockCredential>,
     chunk_size: usize,
+    forge_validate: bool,
     rng: SequentialChallengeSource,
     selected: bool,
     unlocked: bool,
@@ -172,7 +173,10 @@ impl State {
         }
         self.unlocked = true;
         let mut out = Vec::new();
-        let answer = crypto::hmac(Algorithm::Sha1, key.as_ref(), &theirs);
+        let mut answer = crypto::hmac(Algorithm::Sha1, key.as_ref(), &theirs);
+        if self.forge_validate {
+            answer[0] ^= 0x01;
+        }
         tlv::encode(&mut out, TAG_RESPONSE, &answer);
         Ok(out)
     }
@@ -281,6 +285,7 @@ impl MockCard {
             key: None,
             credentials: Vec::new(),
             chunk_size: 255,
+            forge_validate: false,
             rng: SequentialChallengeSource::new(0xC0),
             selected: false,
             unlocked: false,
@@ -321,6 +326,7 @@ impl MockCard {
     /// Answer VALIDATE with a wrong HMAC, as a card that does not hold the
     /// key would.
     pub fn with_forged_validate_response(self) -> Self {
+        self.state().forge_validate = true;
         self
     }
 
