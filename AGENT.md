@@ -25,6 +25,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 
 - YubiKey NEO 3.4.9 (serial 4551023), interfaces OTP+FIDO+CCID, OATH applet version 1.0.0.
 - One credential: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user confirmed it uses the RFC 6238 SHA-256 test secret `12345678901234567890123456789012` (ASCII, 32 bytes), so expected codes can be checked against the RFC 6238 Appendix B vectors as well as `ykman oath accounts code`. Verified 2026-10-06: SHA-256, **8 digits**, 30s period; `ykman` code matched an independent Python computation.
+- Device ID (PBKDF2 salt, not secret): `4d17581a446ffed1`.
 - OATH password protection was disabled at first; the user enabled it on 2026-10-06 and put the password in `.env` as `OATH_HW_PASSWORD` (git-ignored). Never print `.env` values; load it with `sh -c 'set -a; . ./.env; set +a; ...'`.
 - Hardware integration tests must not run in normal `cargo test` (section 14.1: no hardware in tests). Plan: put them in `tests/` behind an opt-in (a Cargo feature or env var), and compare with `ykman oath accounts code`.
 - The NEO's older applet may not support SHA512 credentials; do not assume it does in hardware tests.
@@ -42,7 +43,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 1. Set OATH password: done by the user (2026-10-06).
 2. Add one 60s TOTP, one touch-required TOTP, one HOTP: **pending, user action** (only `RFC6238:sha256` exists now).
 3. Codes match `ykman oath accounts code`: done for `RFC6238:sha256` (`15566265` while unprotected; protected unlock path matches the RFC secret).
-4. PBKDF2 fixture: **pending, see Open questions** (do not commit a real-password fixture).
+4. PBKDF2 fixture: done, kept in `.env` (`OATH_HW_DERIVED_KEY`), checked by `hw_pbkdf2_matches_independent_fixture`.
 5. Unplug and replug with the page open: **pending, user action** (needs step 13 frontend to be meaningful).
 6. Logs contain no password or codes: password checked absent from a real server run's log; codes covered by `logs_never_contain_password_key_session_id_or_codes`.
 
@@ -74,7 +75,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - ~~Dropshot: which response types allow custom headers?~~ Resolved: `HttpResponseHeaders<T>::headers_mut()` (keeps typed OpenAPI) and `Response<Body>`.
 - ~~Dropshot: can `HttpError` carry `Retry-After` for 429?~~ Resolved: yes, `HttpError.headers` / `headers_mut()`; applied when rendered.
 - ~~Dropshot: `TypedBody` on non-JSON `Content-Type`?~~ Resolved: a missing `Content-Type` is treated as JSON, `application/*+json` is accepted, other types get 400. So POST handlers call `security::require_json` (400 too, for one consistent status).
-- PBKDF2 fixture from a real key (section 14.4 item 4): **do not commit a fixture derived from the real OATH password**. The derived key is all that is needed to unlock the applet, so it is as sensitive as the password. Either use a throwaway password set only for the capture, or skip this item (the crypto is already checked against independent Python vectors and the hardware unlock test). Ask the user.
+- ~~PBKDF2 fixture from a real key (section 14.4 item 4)~~ Resolved 2026-10-06 (user's suggestion): the fixture lives in the git-ignored `.env` as `OATH_HW_DERIVED_KEY`, computed with Python `hashlib` from `OATH_HW_PASSWORD` and the device ID, and checked by `hw_pbkdf2_matches_independent_fixture`. It is password-equivalent, so it must never be committed.
 
 ## Decisions log
 
@@ -158,3 +159,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Step 11 done. 255 tests green, fmt and clippy clean. Coverage 98.8% lines overall; every `api/*` file 100% except `server.rs` 98.9%. Read Dropshot 0.17.1 source to answer the section 9a questions (see Open questions and Decisions).
 - 2026-10-06: Step 12 done. 263 unit tests green, fmt and clippy clean (also with `--features hardware-tests`). Coverage with the pcsc/main exclusion: 99.0% lines. On the real NEO: connect, SELECT, reconnect, CALCULATE ALL (code matched ykman), and the no-password refusal all work. Unlock/VALIDATE on hardware waits for the user to set an OATH password.
 - 2026-10-06: With the key password-protected, all 6 hardware tests pass after fixing the `6A80` bug. Smoke-tested the real binary against the key with curl: healthz 200, wrong password 401 then 429 (`Retry-After: 1`), unlock 204 + cookie, codes OK, lock 204, codes after lock 401, SIGTERM exit 0, log free of the password.
+- 2026-10-06: Added `hw_pbkdf2_matches_independent_fixture`; fixture computed into `.env` without printing it. All 7 hardware tests pass.

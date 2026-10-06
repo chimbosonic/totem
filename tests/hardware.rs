@@ -11,6 +11,11 @@
 //! # Key with a password: checks unlock and codes.
 //! OATH_HW_PASSWORD='...' cargo test --features hardware-tests --test hardware -- --test-threads=1
 //! ```
+//!
+//! `OATH_HW_DERIVED_KEY` (hex) is the PBKDF2 fixture from PLAN.md section
+//! 14.4, computed independently of this crate (see
+//! `hw_pbkdf2_matches_independent_fixture`). It unlocks the key just like the
+//! password does, so keep it in the git-ignored `.env`, never in the repo.
 #![cfg(feature = "hardware-tests")]
 
 use std::sync::Arc;
@@ -51,10 +56,14 @@ fn hw_select_reports_applet_over_pcsc() {
     let mut tx = card.transaction().unwrap();
     let data = send(&mut *tx, &proto::select_apdu(), Command::Select).unwrap();
     let select = proto::parse_select(&data).unwrap();
+    let device_id: String = select
+        .device_id
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     println!(
-        "version: {:?}, device id: {} bytes, password: {}",
+        "version: {:?}, device id: {device_id}, password: {}",
         select.version,
-        select.device_id.len(),
         select.auth.is_some()
     );
     assert!(!select.version.is_empty());
@@ -173,4 +182,33 @@ fn hw_calculate_all_on_unprotected_key_matches_rfc6238_secret() {
         code.digits
     );
     assert_eq!(code.to_code(), expected);
+}
+
+/// PLAN.md section 14.4 item 4: our PBKDF2 matches a key derived outside
+/// this crate for the real password and device ID. Capture the fixture with:
+///
+/// ```sh
+/// python3 -c 'import hashlib,os,sys; print(hashlib.pbkdf2_hmac("sha1",
+///   os.environ["OATH_HW_PASSWORD"].encode(), bytes.fromhex(sys.argv[1]),
+///   1000, 16).hex())' <device id hex from hw_select_reports_applet_over_pcsc>
+/// ```
+#[test]
+fn hw_pbkdf2_matches_independent_fixture() {
+    let (Some(password), Ok(expected)) = (password(), std::env::var("OATH_HW_DERIVED_KEY")) else {
+        panic!("set OATH_HW_PASSWORD and OATH_HW_DERIVED_KEY (see this test's docs)");
+    };
+    let mut card = PcscCard::connect(reader_filter().as_deref()).expect("connect to YubiKey");
+    let mut tx = card.transaction().unwrap();
+    let data = send(&mut *tx, &proto::select_apdu(), Command::Select).unwrap();
+    let device_id = proto::parse_select(&data).unwrap().device_id;
+
+    let derived: String = crypto::derive_key(&password, &device_id)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // Compare without printing either value on failure.
+    assert!(
+        derived == expected.trim().to_ascii_lowercase(),
+        "derived key does not match OATH_HW_DERIVED_KEY"
+    );
 }
