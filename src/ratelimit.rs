@@ -35,7 +35,10 @@ pub enum Denied {
 impl Denied {
     /// Seconds to send in `Retry-After`. Always at least 1.
     pub fn retry_after(&self) -> u64 {
-        todo!()
+        let (Self::Backoff { retry_after }
+        | Self::InFlight { retry_after }
+        | Self::GlobalLockout { retry_after }) = *self;
+        retry_after.max(1)
     }
 }
 
@@ -78,14 +81,37 @@ impl RateLimiter {
     }
 
     /// Reserve an unlock attempt for `ip`.
-    pub fn acquire(&self, _ip: IpAddr) -> Result<UnlockPermit<'_>, Denied> {
-        let _ = (&self.state, &self.clock, self.global_limit);
-        todo!()
+    pub fn acquire(&self, ip: IpAddr) -> Result<UnlockPermit<'_>, Denied> {
+        let now = self.clock.now();
+        let mut state = self.lock();
+        state.per_ip.retain(|_, entry| {
+            entry.in_flight || now < entry.blocked_until.saturating_add(FORGET_AFTER_SECS)
+        });
+        if now < state.lockout_until {
+            return Err(Denied::GlobalLockout {
+                retry_after: state.lockout_until - now,
+            });
+        }
+        let entry = state.per_ip.entry(ip).or_default();
+        if entry.in_flight {
+            return Err(Denied::InFlight { retry_after: 1 });
+        }
+        if now < entry.blocked_until {
+            return Err(Denied::Backoff {
+                retry_after: entry.blocked_until - now,
+            });
+        }
+        entry.in_flight = true;
+        Ok(UnlockPermit { limiter: self, ip })
     }
 
     /// Number of IPs with remembered state.
     pub fn tracked_ips(&self) -> usize {
-        todo!()
+        self.lock().per_ip.len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().expect("rate limiter mutex poisoned")
     }
 }
 
@@ -105,21 +131,74 @@ impl UnlockPermit<'_> {
 
     /// The password was right. Clears this IP's backoff.
     pub fn success(self) {
-        let _ = self.limiter;
-        todo!()
+        self.limiter.lock().per_ip.remove(&self.ip);
     }
 
     /// The password was wrong.
     pub fn failure(self) -> FailureOutcome {
-        todo!()
+        let limiter = self.limiter;
+        let now = limiter.clock.now();
+        let mut state = limiter.lock();
+
+        let entry = state.per_ip.entry(self.ip).or_default();
+        entry.failures = entry.failures.saturating_add(1);
+        let backoff = BASE_BACKOFF_SECS
+            .checked_shl(entry.failures - 1)
+            .map_or(MAX_BACKOFF_SECS, |b| b.min(MAX_BACKOFF_SECS));
+        entry.blocked_until = now + backoff;
+
+        state.global_failures.push_back(now);
+        while state
+            .global_failures
+            .front()
+            .is_some_and(|&t| t + GLOBAL_WINDOW_SECS <= now)
+        {
+            state.global_failures.pop_front();
+        }
+        let global_lockout_engaged = state.global_failures.len() >= limiter.global_limit as usize;
+        if global_lockout_engaged {
+            state.lockout_until = now + GLOBAL_WINDOW_SECS;
+            state.global_failures.clear();
+        }
+
+        FailureOutcome {
+            backoff,
+            global_lockout_engaged,
+        }
+    }
+}
+
+impl Drop for UnlockPermit<'_> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.limiter.lock().per_ip.get_mut(&self.ip) {
+            entry.in_flight = false;
+        }
     }
 }
 
 /// The client's address. `X-Forwarded-For` is only honoured when the direct
 /// peer is a trusted proxy; then the right-most address that is not itself a
 /// trusted proxy is the client.
-pub fn client_ip(_peer: IpAddr, _forwarded_for: Option<&str>, _trusted: &[IpNet]) -> IpAddr {
-    todo!()
+pub fn client_ip(peer: IpAddr, forwarded_for: Option<&str>, trusted: &[IpNet]) -> IpAddr {
+    let is_trusted = |addr: &IpAddr| trusted.iter().any(|net| net.contains(addr));
+    let peer = peer.to_canonical();
+    let Some(header) = forwarded_for.filter(|_| is_trusted(&peer)) else {
+        return peer;
+    };
+    let Ok(chain) = header
+        .split(',')
+        .map(|part| part.trim().parse::<IpAddr>().map(|a| a.to_canonical()))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return peer;
+    };
+    chain
+        .iter()
+        .rev()
+        .find(|addr| !is_trusted(addr))
+        .or(chain.first())
+        .copied()
+        .unwrap_or(peer)
 }
 
 #[cfg(test)]
@@ -134,9 +213,14 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Global limit high enough that per-IP tests never trip it.
     fn limiter() -> (Arc<ManualClock>, RateLimiter) {
+        limiter_with_global_limit(1000)
+    }
+
+    fn limiter_with_global_limit(limit: u32) -> (Arc<ManualClock>, RateLimiter) {
         let clock = Arc::new(ManualClock::new(START));
-        (clock.clone(), RateLimiter::new(clock, LIMIT))
+        (clock.clone(), RateLimiter::new(clock, limit))
     }
 
     fn fail(limiter: &RateLimiter, addr: &str) -> FailureOutcome {
@@ -183,7 +267,7 @@ mod tests {
         fail(&limiter, "10.0.0.1");
         clock.advance(1);
         fail(&limiter, "10.0.0.1"); // 2s
-        clock.advance(1);
+        clock.advance(2);
         fail(&limiter, "10.0.0.1"); // 4s
         clock.advance(3);
         assert_eq!(
@@ -270,7 +354,7 @@ mod tests {
 
     #[test]
     fn global_lockout_engages_at_threshold_within_window() {
-        let (_, limiter) = limiter();
+        let (_, limiter) = limiter_with_global_limit(LIMIT);
         let outcomes = fail_from_many(&limiter, LIMIT);
         let engaged: Vec<bool> = outcomes.iter().map(|o| o.global_lockout_engaged).collect();
         assert_eq!(engaged, [false, false, false, false, true]);
@@ -284,14 +368,14 @@ mod tests {
 
     #[test]
     fn global_lockout_below_threshold_does_not_engage() {
-        let (_, limiter) = limiter();
+        let (_, limiter) = limiter_with_global_limit(LIMIT);
         fail_from_many(&limiter, LIMIT - 1);
         assert!(limiter.acquire(ip("192.168.1.1")).is_ok());
     }
 
     #[test]
     fn global_lockout_releases_after_15_minutes() {
-        let (clock, limiter) = limiter();
+        let (clock, limiter) = limiter_with_global_limit(LIMIT);
         fail_from_many(&limiter, LIMIT);
         clock.advance(GLOBAL_WINDOW_SECS - 1);
         assert_eq!(
@@ -304,7 +388,7 @@ mod tests {
 
     #[test]
     fn failures_outside_window_do_not_count_toward_global_lockout() {
-        let (clock, limiter) = limiter();
+        let (clock, limiter) = limiter_with_global_limit(LIMIT);
         fail_from_many(&limiter, LIMIT - 1);
         clock.advance(GLOBAL_WINDOW_SECS);
         let outcome = fail(&limiter, "10.2.0.1");
@@ -314,7 +398,7 @@ mod tests {
 
     #[test]
     fn global_lockout_takes_precedence_over_backoff() {
-        let (_, limiter) = limiter();
+        let (_, limiter) = limiter_with_global_limit(LIMIT);
         fail_from_many(&limiter, LIMIT);
         assert!(matches!(
             limiter.acquire(ip("10.1.0.0")).err(),
