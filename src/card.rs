@@ -43,8 +43,12 @@ pub trait OathCard: Send {
 
 /// Pick a reader: the first whose name contains `filter`, or without a
 /// filter the first containing "YubiKey". Matching ignores case.
-pub fn pick_reader<'a>(_readers: &'a [String], _filter: Option<&str>) -> Option<&'a str> {
-    todo!()
+pub fn pick_reader<'a>(readers: &'a [String], filter: Option<&str>) -> Option<&'a str> {
+    let needle = filter.unwrap_or("YubiKey").to_lowercase();
+    readers
+        .iter()
+        .find(|name| name.to_lowercase().contains(&needle))
+        .map(String::as_str)
 }
 
 /// Send `apdu`, follow SEND REMAINING chaining, and return the response

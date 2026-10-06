@@ -42,7 +42,8 @@ pub struct CardInfo {
 impl CardInfo {
     /// Applet version as dotted decimal, for example `5.7.0`.
     pub fn version_string(&self) -> String {
-        todo!()
+        let parts: Vec<String> = self.version.iter().map(u8::to_string).collect();
+        parts.join(".")
     }
 }
 
