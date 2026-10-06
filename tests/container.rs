@@ -30,10 +30,18 @@ fn dockerfile_builds_on_rust_bookworm_and_runs_on_slim() {
     let dockerfile = read("Dockerfile");
     let stages = stages(&dockerfile);
     assert_eq!(stages.len(), 2, "builder and runtime stages");
-    assert!(stages[0].contains("FROM rust:1-bookworm AS build"), "{}", stages[0]);
+    assert!(
+        stages[0].contains("FROM rust:1-bookworm AS build"),
+        "{}",
+        stages[0]
+    );
     assert!(stages[0].contains("libpcsclite-dev") && stages[0].contains("pkg-config"));
     assert!(stages[0].contains("cargo build --release --locked"));
-    assert!(stages[1].starts_with("FROM debian:bookworm-slim"), "{}", stages[1]);
+    assert!(
+        stages[1].starts_with("FROM debian:bookworm-slim"),
+        "{}",
+        stages[1]
+    );
 }
 
 #[test]
@@ -61,8 +69,14 @@ fn runtime_image_runs_as_non_root() {
         .rev()
         .find(|l| l.trim_start().starts_with("USER "))
         .expect("USER in runtime stage");
-    let uid = user.trim_start()["USER ".len()..].split(':').next().unwrap().trim();
-    let uid: u32 = uid.parse().expect("numeric uid, so Kubernetes-style runAsNonRoot checks work");
+    let uid = user.trim_start()["USER ".len()..]
+        .split(':')
+        .next()
+        .unwrap()
+        .trim();
+    let uid: u32 = uid
+        .parse()
+        .expect("numeric uid, so Kubernetes-style runAsNonRoot checks work");
     assert!(uid >= 1000, "{user}");
     assert!(runtime.contains("ENTRYPOINT [\"/usr/local/bin/oath-web\"]"));
 }
@@ -73,7 +87,9 @@ fn dockerignore_keeps_secrets_and_build_output_out_of_the_context() {
     let entries: Vec<&str> = ignore.lines().map(str::trim).collect();
     for required in [".env", ".git", "target"] {
         assert!(
-            entries.iter().any(|e| e.trim_start_matches('/') == required),
+            entries
+                .iter()
+                .any(|e| e.trim_start_matches('/') == required),
             ".dockerignore must list {required}"
         );
     }
@@ -90,7 +106,10 @@ fn compose_hardens_the_container() {
         "restart: unless-stopped",
         "external: true",
     ] {
-        assert!(compose.contains(required), "docker-compose.yml lacks {required}");
+        assert!(
+            compose.contains(required),
+            "docker-compose.yml lacks {required}"
+        );
     }
 }
 
@@ -98,7 +117,9 @@ fn compose_hardens_the_container() {
 fn compose_publishes_no_host_port() {
     let compose = read("docker-compose.yml");
     assert!(
-        !compose.lines().any(|l| l.trim_start().starts_with("ports:")),
+        !compose
+            .lines()
+            .any(|l| l.trim_start().starts_with("ports:")),
         "only Traefik may reach the service"
     );
 }
@@ -114,7 +135,10 @@ fn traefik_headers_middleware_matches_the_app() {
         "traefik.http.middlewares.oath-headers.headers.contentSecurityPolicy: \"{}\"",
         oath_web::api::security::CSP
     );
-    assert!(compose.contains(&csp), "CSP in compose must equal the app's");
+    assert!(
+        compose.contains(&csp),
+        "CSP in compose must equal the app's"
+    );
     for required in [
         "traefik.http.middlewares.oath-headers.headers.contentTypeNosniff: \"true\"",
         "traefik.http.middlewares.oath-headers.headers.frameDeny: \"true\"",
@@ -123,6 +147,9 @@ fn traefik_headers_middleware_matches_the_app() {
         "traefik.http.middlewares.oath-lan.ipallowlist.sourcerange:",
         "traefik.http.services.oath.loadbalancer.server.port: \"8080\"",
     ] {
-        assert!(compose.contains(required), "docker-compose.yml lacks {required}");
+        assert!(
+            compose.contains(required),
+            "docker-compose.yml lacks {required}"
+        );
     }
 }
