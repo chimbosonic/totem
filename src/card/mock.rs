@@ -7,11 +7,13 @@
 //! Not emulated: touch (CALCULATE on a touch or HOTP credential is refused)
 //! and credential management.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{CardError, CardTransaction, OathCard};
 use crate::oath::crypto::{self, Algorithm, DerivedKey};
 use crate::oath::proto::AID;
+use crate::oath::tlv;
+use crate::rng::{ChallengeSource, SequentialChallengeSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockKind {
@@ -72,9 +74,197 @@ pub enum MockEvent {
     Reconnect,
 }
 
+const SW_OK: u16 = 0x9000;
+const SW_WRONG_LENGTH: u16 = 0x6700;
+const SW_AUTH_REQUIRED: u16 = 0x6982;
+const SW_NO_SUCH_OBJECT: u16 = 0x6984;
+const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
+const SW_WRONG_DATA: u16 = 0x6A80;
+const SW_FILE_NOT_FOUND: u16 = 0x6A82;
+const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
+
+struct State {
+    version: [u8; 3],
+    device_id: [u8; 8],
+    key: Option<DerivedKey>,
+    credentials: Vec<MockCredential>,
+    chunk_size: usize,
+    rng: SequentialChallengeSource,
+    selected: bool,
+    unlocked: bool,
+    challenge: Option<[u8; 8]>,
+    pending: Vec<u8>,
+    fault: Option<(MockFault, usize)>,
+    events: Vec<MockEvent>,
+}
+
+type Reply = Result<Vec<u8>, u16>;
+
+impl State {
+    /// Forget selection and unlock, as a reconnect, removal, or reset does.
+    fn drop_session(&mut self) {
+        self.selected = false;
+        self.unlocked = false;
+        self.challenge = None;
+        self.pending.clear();
+    }
+
+    fn handle(&mut self, apdu: &[u8]) -> Vec<u8> {
+        let reply = match parse_apdu(apdu) {
+            None => Err(SW_WRONG_LENGTH),
+            Some((ins, p1, data)) => {
+                if ins != INS_SEND_REMAINING {
+                    self.pending.clear();
+                }
+                match (ins, p1) {
+                    (INS_SELECT_OR_CALCULATE_ALL, 0x04) => self.select(data),
+                    (INS_SELECT_OR_CALCULATE_ALL, _) => self.calculate_all(data),
+                    (INS_VALIDATE, _) => self.validate(data),
+                    (INS_CALCULATE, _) => self.calculate(data),
+                    (INS_SEND_REMAINING, _) => Ok(std::mem::take(&mut self.pending)),
+                    _ => Err(SW_INS_NOT_SUPPORTED),
+                }
+            }
+        };
+        match reply {
+            Err(sw) => sw.to_be_bytes().to_vec(),
+            Ok(mut data) => {
+                let sw = if data.len() > self.chunk_size {
+                    self.pending = data.split_off(self.chunk_size);
+                    0x6100 | self.pending.len().min(0xFF) as u16
+                } else {
+                    SW_OK
+                };
+                data.extend_from_slice(&sw.to_be_bytes());
+                data
+            }
+        }
+    }
+
+    fn select(&mut self, data: &[u8]) -> Reply {
+        if data != AID {
+            return Err(SW_FILE_NOT_FOUND);
+        }
+        self.selected = true;
+        self.unlocked = self.key.is_none();
+        let mut out = Vec::new();
+        tlv::encode(&mut out, TAG_VERSION, &self.version);
+        tlv::encode(&mut out, TAG_NAME, &self.device_id);
+        self.challenge = None;
+        if self.key.is_some() {
+            let challenge = self.rng.challenge();
+            self.challenge = Some(challenge);
+            tlv::encode(&mut out, TAG_CHALLENGE, &challenge);
+            tlv::encode(&mut out, TAG_ALGORITHM, &[ALGORITHM_SHA1]);
+        }
+        Ok(out)
+    }
+
+    fn validate(&mut self, data: &[u8]) -> Reply {
+        let (Some(key), Some(challenge)) = (&self.key, self.challenge.take()) else {
+            return Err(SW_NO_SUCH_OBJECT);
+        };
+        let response = find(data, TAG_RESPONSE)?;
+        let theirs = find(data, TAG_CHALLENGE)?;
+        let expected = crypto::hmac(Algorithm::Sha1, key.as_ref(), &challenge);
+        if !crypto::constant_time_eq(&response, &expected) {
+            return Err(SW_NO_SUCH_OBJECT);
+        }
+        self.unlocked = true;
+        let mut out = Vec::new();
+        let answer = crypto::hmac(Algorithm::Sha1, key.as_ref(), &theirs);
+        tlv::encode(&mut out, TAG_RESPONSE, &answer);
+        Ok(out)
+    }
+
+    fn require_unlocked(&self) -> Result<(), u16> {
+        match (self.selected, self.unlocked) {
+            (false, _) => Err(SW_CONDITIONS_NOT_SATISFIED),
+            (true, false) => Err(SW_AUTH_REQUIRED),
+            (true, true) => Ok(()),
+        }
+    }
+
+    fn calculate_all(&mut self, data: &[u8]) -> Reply {
+        self.require_unlocked()?;
+        let challenge = find(data, TAG_CHALLENGE)?;
+        let mut out = Vec::new();
+        for credential in &self.credentials {
+            tlv::encode(&mut out, TAG_NAME, &credential.name);
+            match (credential.kind, credential.touch) {
+                (MockKind::Hotp, _) => tlv::encode(&mut out, TAG_HOTP, &[credential.digits]),
+                (MockKind::Totp, true) => tlv::encode(&mut out, TAG_TOUCH, &[credential.digits]),
+                (MockKind::Totp, false) => {
+                    tlv::encode(&mut out, TAG_TRUNCATED, &truncated(credential, &challenge))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn calculate(&mut self, data: &[u8]) -> Reply {
+        self.require_unlocked()?;
+        let name = find(data, TAG_NAME)?;
+        let challenge = find(data, TAG_CHALLENGE)?;
+        let credential = self
+            .credentials
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or(SW_NO_SUCH_OBJECT)?;
+        if credential.kind != MockKind::Totp || credential.touch {
+            return Err(SW_CONDITIONS_NOT_SATISFIED);
+        }
+        let mut out = Vec::new();
+        tlv::encode(&mut out, TAG_TRUNCATED, &truncated(credential, &challenge));
+        Ok(out)
+    }
+}
+
+const INS_SELECT_OR_CALCULATE_ALL: u8 = 0xA4;
+const INS_CALCULATE: u8 = 0xA2;
+const INS_VALIDATE: u8 = 0xA3;
+const INS_SEND_REMAINING: u8 = 0xA5;
+const TAG_NAME: u8 = 0x71;
+const TAG_CHALLENGE: u8 = 0x74;
+const TAG_RESPONSE: u8 = 0x75;
+const TAG_TRUNCATED: u8 = 0x76;
+const TAG_HOTP: u8 = 0x77;
+const TAG_VERSION: u8 = 0x79;
+const TAG_ALGORITHM: u8 = 0x7B;
+const TAG_TOUCH: u8 = 0x7C;
+const ALGORITHM_SHA1: u8 = 0x01;
+
+/// Split a short APDU into INS, P1, and data. `None` if the length is wrong.
+fn parse_apdu(apdu: &[u8]) -> Option<(u8, u8, &[u8])> {
+    let (header, rest) = apdu.split_first_chunk::<4>()?;
+    let [_, ins, p1, _] = *header;
+    let data = match rest.split_first() {
+        None => &[][..],
+        Some((&lc, data)) if data.len() == usize::from(lc) => data,
+        Some(_) => return None,
+    };
+    Some((ins, p1, data))
+}
+
+fn find(data: &[u8], tag: u8) -> Result<Vec<u8>, u16> {
+    tlv::parse_all(data)
+        .map_err(|_| SW_WRONG_DATA)?
+        .into_iter()
+        .find(|item| item.tag == tag)
+        .map(|item| item.value.to_vec())
+        .ok_or(SW_WRONG_DATA)
+}
+
+/// Digits byte plus the dynamically truncated value, top bit cleared.
+fn truncated(credential: &MockCredential, challenge: &[u8]) -> [u8; 5] {
+    let mac = crypto::hmac(credential.algorithm, &credential.secret, challenge);
+    let [a, b, c, d] = crypto::dynamic_truncate(&mac);
+    [credential.digits, a & 0x7F, b, c, d]
+}
+
 #[derive(Clone)]
 pub struct MockCard {
-    _state: Arc<Mutex<()>>,
+    state: Arc<Mutex<State>>,
 }
 
 impl MockCard {
@@ -85,35 +275,62 @@ impl MockCard {
 
     /// A card with no password and no credentials.
     pub fn new() -> Self {
-        todo!()
+        let state = State {
+            version: Self::DEFAULT_VERSION,
+            device_id: Self::DEFAULT_DEVICE_ID,
+            key: None,
+            credentials: Vec::new(),
+            chunk_size: 255,
+            rng: SequentialChallengeSource::new(0xC0),
+            selected: false,
+            unlocked: false,
+            challenge: None,
+            pending: Vec::new(),
+            fault: None,
+            events: Vec::new(),
+        };
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().expect("mock card mutex poisoned")
     }
 
     /// Set the OATH password. The key is derived from it and the device ID.
-    pub fn with_password(self, _password: &str) -> Self {
-        todo!()
+    pub fn with_password(self, password: &str) -> Self {
+        {
+            let mut state = self.state();
+            state.key = Some(crypto::derive_key(password, &state.device_id));
+        }
+        self
     }
 
-    pub fn with_credential(self, _credential: MockCredential) -> Self {
-        todo!()
+    pub fn with_credential(self, credential: MockCredential) -> Self {
+        self.state().credentials.push(credential);
+        self
     }
 
     /// Largest response data chunk before SEND REMAINING is needed.
-    pub fn with_chunk_size(self, _chunk_size: usize) -> Self {
-        todo!()
+    pub fn with_chunk_size(self, chunk_size: usize) -> Self {
+        self.state().chunk_size = chunk_size;
+        self
     }
 
-    /// Fail the next `count` APDUs with `fault`. The card loses its
-    /// selected and unlocked state, as a real removal or reset would.
-    pub fn fail_next(&self, _count: usize, _fault: MockFault) {
-        todo!()
+    /// Fail the next `count` APDUs with `fault`, replacing any earlier
+    /// fault. The card loses its selected and unlocked state, as a real
+    /// removal or reset would.
+    pub fn fail_next(&self, count: usize, fault: MockFault) {
+        self.state().fault = Some((fault, count));
     }
 
     pub fn events(&self) -> Vec<MockEvent> {
-        todo!()
+        self.state().events.clone()
     }
 
     pub fn clear_events(&self) {
-        todo!()
+        self.state().events.clear();
     }
 }
 
@@ -125,11 +342,46 @@ impl Default for MockCard {
 
 impl OathCard for MockCard {
     fn transaction(&mut self) -> Result<Box<dyn CardTransaction + '_>, CardError> {
-        todo!()
+        self.state().events.push(MockEvent::Begin);
+        Ok(Box::new(MockTransaction { card: self }))
     }
 
     fn reconnect(&mut self) -> Result<(), CardError> {
-        todo!()
+        let mut state = self.state();
+        state.events.push(MockEvent::Reconnect);
+        state.drop_session();
+        Ok(())
+    }
+}
+
+struct MockTransaction<'a> {
+    card: &'a MockCard,
+}
+
+impl CardTransaction for MockTransaction<'_> {
+    fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>, CardError> {
+        let mut state = self.card.state();
+        state.events.push(MockEvent::Apdu(apdu.to_vec()));
+        if let Some((fault, remaining)) = state.fault.take()
+            && remaining > 0
+        {
+            if remaining > 1 {
+                state.fault = Some((fault, remaining - 1));
+            }
+            state.drop_session();
+            return Err(match fault {
+                MockFault::Removed => CardError::Removed,
+                MockFault::Reset => CardError::Reset,
+                MockFault::NoCard => CardError::NoCard,
+            });
+        }
+        Ok(state.handle(apdu))
+    }
+}
+
+impl Drop for MockTransaction<'_> {
+    fn drop(&mut self) {
+        self.card.state().events.push(MockEvent::End);
     }
 }
 

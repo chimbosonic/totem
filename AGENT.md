@@ -39,7 +39,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 4 | `oath::tlv` | done | `encode`, `parse` (lenient, returns rest), `parse_exact` (strict), `parse_all` (strict sequence), 18 tests |
 | 5 | `oath::crypto` | done | `derive_key`, `hmac`, `dynamic_truncate`, `format_code`, `timestep`, `validity_window`, `constant_time_eq`, `Algorithm`, 17 tests |
 | 6 | `oath::proto` | done | APDU builders, `parse_select`, `verify_validate_response`, `parse_calculate_all`, `parse_calculate`, `transmit_chained`, `status_error`, `parse_name`, 39 tests |
-| 7 | `OathCard` trait and mock card | todo | |
+| 7 | `OathCard` trait and mock card | done | `OathCard`, `CardTransaction`, `CardError`, `card::send`, `card::mock::MockCard`, 29 tests (proto driven end to end against the mock) |
 | 8 | `service` | todo | |
 | 9 | `session` | todo | |
 | 10 | `ratelimit` | todo | |
@@ -91,9 +91,14 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: `parse_select` ignores unknown tags (newer firmware adds some) but requires version and name, and a known algorithm whenever a challenge is present. A card HMAC mismatch in VALIDATE is `CardAuthFailed`.
 - 2026-10-06: CALCULATE ALL entries keep the raw name bytes; name parsing is separate (`parse_name`) so the service can re-send the exact name in CALCULATE. A full `0x75` response (non-truncated) is treated as malformed since we always ask for truncated.
 - 2026-10-06: `parse_name` is infallible. A prefix that is not a positive whole number (`0/`, `/`, overflow, `+5/`) stays in the issuer rather than failing the whole response. Invalid UTF-8 is shown lossily. The period prefix is parsed for every credential type; ykman only does so for TOTP, which only affects how an HOTP named like `60/x` is displayed.
+- 2026-10-06: `OathCard::transaction()` returns `Box<dyn CardTransaction + '_>` that ends on drop, mirroring pcsc's `Transaction<'_>`. The trait is object-safe so the service can hold `Box<dyn OathCard>`. `CardError::needs_reconnect()` is true for everything except `Proto(_)`.
+- 2026-10-06: `MockCard` state is `Arc<Mutex<_>>`, so clones share state: a test keeps a handle for `events()` and `fail_next()` after moving the card into the service. Builder methods (`with_password`, `with_credential`, `with_chunk_size`) mutate shared state too, so build separate cards when a test needs two configurations.
+- 2026-10-06: Mock behaviour choices: the VALIDATE algorithm is always SHA1; the challenge is single-use; reselect, reconnect, or an injected fault drops the unlocked state; CALCULATE on HOTP or touch credentials returns `6985` (touch is not emulated); commands before SELECT return `6985`; SEND REMAINING uses `61xx` with xx capped at `FF`; the default chunk is 255 bytes. Truncated values have the top bit cleared like a real card.
+- 2026-10-06: Mock tests compare against literal RFC 6238 table values rather than recomputing with `oath::crypto`, so the mock and the crypto cannot share a bug unnoticed.
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
 - 2026-10-06: Step 4 done. 46 tests green, fmt and clippy clean. `oath/tlv.rs` 100% line coverage; crate total 97%.
 - 2026-10-06: Step 5 done. 63 tests green, fmt and clippy clean. `oath/crypto.rs` 100% line coverage; crate total 98%. One test had wrong data copied from the PLAN.md example (see decisions); fixed the test, not the code.
 - 2026-10-06: Step 6 done. 102 tests green, fmt and clippy clean. `oath/proto.rs` 99.6% line coverage; crate total 98.6%.
+- 2026-10-06: Step 7 done. 131 tests green, fmt and clippy clean. `card.rs` 100%, `card/mock.rs` 99% line coverage; crate total 98.8%. Caught and fixed two bad tests before going green (a clone sharing state, a chunk size larger than the response).

@@ -3,7 +3,7 @@
 
 pub mod mock;
 
-use crate::oath::proto::{Command, ProtoError};
+use crate::oath::proto::{self, Command, ProtoError};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CardError {
@@ -22,7 +22,7 @@ pub enum CardError {
 impl CardError {
     /// Whether dropping the connection and reconnecting might fix this.
     pub fn needs_reconnect(&self) -> bool {
-        todo!()
+        !matches!(self, Self::Proto(_))
     }
 }
 
@@ -43,11 +43,12 @@ pub trait OathCard: Send {
 /// Send `apdu`, follow SEND REMAINING chaining, and return the response
 /// data if the final status is success.
 pub fn send(
-    _tx: &mut dyn CardTransaction,
-    _apdu: &[u8],
-    _command: Command,
+    tx: &mut dyn CardTransaction,
+    apdu: &[u8],
+    command: Command,
 ) -> Result<Vec<u8>, CardError> {
-    todo!()
+    let response = proto::transmit_chained(|a| tx.transmit(a), apdu)?;
+    Ok(response.into_data(command)?)
 }
 
 #[cfg(test)]
