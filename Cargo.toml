@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+getrandom = "0.4.3"
 slog = "2.8.2"
 slog-async = "2.8.0"
 slog-json = "2.6.1"
