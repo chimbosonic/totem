@@ -318,6 +318,12 @@ impl MockCard {
         self
     }
 
+    /// Answer VALIDATE with a wrong HMAC, as a card that does not hold the
+    /// key would.
+    pub fn with_forged_validate_response(self) -> Self {
+        self
+    }
+
     /// Fail the next `count` APDUs with `fault`, replacing any earlier
     /// fault. The card loses its selected and unlocked state, as a real
     /// removal or reset would.
@@ -522,6 +528,16 @@ mod tests {
         assert_eq!(
             unlock(&mut *tx, &*wrong),
             Err(CardError::Proto(ProtoError::WrongPassword))
+        );
+    }
+
+    #[test]
+    fn forged_validate_response_fails_card_proof() {
+        let mut card = rfc_card().with_forged_validate_response();
+        let mut tx = card.transaction().unwrap();
+        assert_eq!(
+            unlock(&mut *tx, &*key()),
+            Err(CardError::Proto(ProtoError::CardAuthFailed))
         );
     }
 
