@@ -76,7 +76,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 13 | Frontend | done | `static/{index.html,app.js,app.css}`, 13 JS tests (`node --test static/`), 7 Rust static-file rule tests, repo-wide em dash test |
 | 14 | Dockerfile (compose dropped) | done | `Dockerfile`, `.dockerignore`, 4 rule tests (`tests/container.rs`); `docker-compose.yml` removed at the user's request |
 | 15 | CI with coverage gate | done (**GitHub Actions**, not GitLab) | `.github/workflows/ci.yml`, `ci/coverage_gate.py` + 7 tests; actionlint clean; not yet run on GitHub |
-| 16 | README | todo | |
+| 16 | README | done | `README.md`; `readme_documents_every_config_variable` keeps the config table in sync |
 
 ## Open questions and things to verify
 
@@ -172,6 +172,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Running the CI commands locally caught `tests/container.rs` not being rustfmt-formatted (written in step 14 without `cargo fmt`). Fixed in its own commit. Always run `cargo fmt` after writing Rust files.
 - 2026-10-06: Mistake: `ci/__pycache__/*.pyc` was committed with the gate (running the tests creates it). Removed from the index and `__pycache__/` added to `.gitignore`. Check `git status` before committing new tooling.
 - 2026-10-06: User asked to ditch the compose stuff only. Removed `docker-compose.yml`, its 3 rule tests, and the security.rs comment pointing at its headers middleware. Kept the Dockerfile, `.dockerignore`, the image build, and the CI image job. Consequence: no Traefik headers backstop for Dropshot-generated 404/405/400 responses (they hold no secrets). The README (step 16) should not ship a compose file or Traefik labels; it can describe the `docker run` flags (read-only, cap-drop ALL, no-new-privileges, mount /run/pcscd, no published port behind a proxy).
+- 2026-10-06: README covers setup (OATH password, pcscd), configuration, the container with `docker run` hardening flags instead of compose, pcscd options A (host socket, shipped) and B (pcscd in the container, outline only), reverse proxy notes including the framework-generated responses without security headers, threat model, what is never logged, API summary, TDD rules, how to run every check, hardware tests with `.env`, and the manual checklist. No Traefik labels (compose was dropped). A test fails if a new `OATH_*` variable is not documented.
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
@@ -192,3 +193,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Step 14 files written; 7 container rule tests green. Image build still to verify on a container runtime.
 - 2026-10-06: Built the image with Rancher Desktop (Docker 29.5.3, linux/aarch64): 1.5 min cold build, 34.5 MB image, runs as uid 10001, ships `libpcsclite1 1.9.9-2` and `ca-certificates` only (no curl). Run with `--read-only --cap-drop ALL --security-opt no-new-privileges:true` it logs JSON and exits 1 with the "no usable smart card reader" hint, as expected without pcscd. `docker compose config` validated the compose file (since removed). Step 14 done.
 - 2026-10-06: Step 15 done: GitHub Actions workflow, actionlint clean, every command passes locally (277 Rust tests, 13 JS, 7 gate tests, coverage gate passes). Not run on GitHub yet: there is no remote.
+- 2026-10-06: Step 16 done. All 16 build steps complete. 275 Rust tests, 13 JS tests, 7 gate tests, 9 hardware tests (opt-in) green.

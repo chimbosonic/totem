@@ -40,3 +40,26 @@ fn no_em_dashes_in_docs_comments_or_ui() {
         .collect();
     assert!(offenders.is_empty(), "em dash in {offenders:?}");
 }
+
+/// Every `OATH_*` variable the service reads is documented in the README.
+#[test]
+fn readme_documents_every_config_variable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config = fs::read_to_string(root.join("src/config.rs")).unwrap();
+    let readme = fs::read_to_string(root.join("README.md")).unwrap_or_default();
+    let mut vars: Vec<&str> = config
+        .split('"')
+        .filter(|s| s.starts_with("OATH_") && s.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+        .collect();
+    vars.sort_unstable();
+    vars.dedup();
+    assert_eq!(vars.len(), 7, "{vars:?}");
+    let missing: Vec<_> = vars
+        .iter()
+        .filter(|v| !readme.contains(&format!("`{v}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "README.md does not document {missing:?}"
+    );
+}
