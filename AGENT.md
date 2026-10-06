@@ -25,7 +25,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 
 | # | Step | Status | Notes |
 |---|---|---|---|
-| 1 | Scaffold crate, forbid unsafe, logging, placeholder test | todo | |
+| 1 | Scaffold crate, forbid unsafe, logging, placeholder test | done | `logging::build_logger` (slog-json + slog-async), 2 tests |
 | 2 | `clock` and `rng` traits | todo | |
 | 3 | `config` | todo | |
 | 4 | `oath::tlv` | todo | |
@@ -53,8 +53,12 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 ## Decisions log
 
 - 2026-10-06: Repo has no commits yet. Created `AGENT.md` for tracking notes.
+- 2026-10-06: Logic lives in `src/lib.rs` modules; `src/main.rs` stays thin so it can be excluded from coverage.
+- 2026-10-06: Logging uses `slog-json` with default keys (`msg`, `level`, `ts`) behind `slog-async`, filtered by `LevelFilter`. Level parsing from `OATH_LOG_LEVEL` is deferred to `config` (step 3); `main` hardcodes `Info` for now.
+- 2026-10-06: Red and green are committed separately to keep TDD visible in history.
 
 ## Session log
 
 - 2026-10-06: Read `PLAN.md`, checked toolchain, created this file.
 - 2026-10-06: Installed `llvm-tools` and `cargo-llvm-cov` 0.9.1.
+- 2026-10-06: Step 1 done. fmt, clippy, tests green. `logging.rs` line coverage 96%; crate total 88% (includes `main.rs`, to be excluded via `--ignore-filename-regex` in CI).

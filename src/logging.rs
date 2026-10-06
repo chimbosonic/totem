@@ -2,11 +2,20 @@
 
 use std::io::Write;
 
-use slog::{Discard, Level, Logger, o};
+use slog::{Drain, Level, LevelFilter, Logger, o};
 
 /// Build a JSON logger that writes one object per line to `writer`.
-pub fn build_logger<W: Write + Send + 'static>(_writer: W, _level: Level) -> Logger {
-    Logger::root(Discard, o!())
+///
+/// Records are written on a background thread. Dropping the last clone of the
+/// returned logger flushes everything still queued.
+pub fn build_logger<W: Write + Send + 'static>(writer: W, level: Level) -> Logger {
+    let json = slog_json::Json::new(writer)
+        .add_default_keys()
+        .build()
+        .fuse();
+    let filtered = LevelFilter::new(json, level).fuse();
+    let drain = slog_async::Async::new(filtered).build().fuse();
+    Logger::root(drain, o!())
 }
 
 #[cfg(test)]
