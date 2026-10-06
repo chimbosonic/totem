@@ -7,3 +7,4 @@ pub mod logging;
 pub mod oath;
 pub mod rng;
 pub mod service;
+pub mod session;
