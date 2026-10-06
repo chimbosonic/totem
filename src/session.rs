@@ -58,6 +58,34 @@ impl fmt::Debug for SessionId {
     }
 }
 
+/// Proof that a request carries a live session. Only
+/// [`SessionStore::authenticate`] creates one, so code that needs the key
+/// cannot run without a session check first.
+pub struct AuthedSession {
+    id: SessionId,
+    key: DerivedKey,
+}
+
+impl AuthedSession {
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    pub fn log_id(&self) -> String {
+        self.id.log_id()
+    }
+
+    pub(crate) fn key(&self) -> &DerivedKey {
+        &self.key
+    }
+}
+
+impl fmt::Debug for AuthedSession {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+    }
+}
+
 struct Entry {
     key: DerivedKey,
     created: u64,
@@ -116,6 +144,11 @@ impl SessionStore {
         }
         entry.last_seen = now;
         Some(entry.key.clone())
+    }
+
+    /// Like [`touch`](Self::touch), but returns proof of the live session.
+    pub fn authenticate(&self, _id: SessionId) -> Option<AuthedSession> {
+        todo!()
     }
 
     /// Delete a session. Returns whether it existed.
@@ -352,6 +385,47 @@ mod tests {
         assert_eq!(log_id, SessionId([0xAB; 32]).log_id());
         assert_ne!(log_id, SessionId([0xAC; 32]).log_id());
         assert!(!id.to_cookie_value().contains(&log_id));
+    }
+
+    #[test]
+    fn authenticate_returns_session_with_id_and_key() {
+        let (_, store) = store();
+        let id = store.create(key(4));
+        let session = store.authenticate(id.clone()).unwrap();
+        assert_eq!(session.id(), &id);
+        assert_eq!(session.log_id(), id.log_id());
+        assert_eq!(**session.key(), [4; KEY_LEN]);
+    }
+
+    #[test]
+    fn authenticate_refreshes_idle_like_touch() {
+        let (clock, store) = store();
+        let id = store.create(key(4));
+        clock.advance(IDLE - 1);
+        assert!(store.authenticate(id.clone()).is_some());
+        clock.advance(IDLE - 1);
+        assert!(store.authenticate(id).is_some());
+    }
+
+    #[test]
+    fn authenticate_rejects_unknown_and_expired() {
+        let (clock, store) = store();
+        assert!(store.authenticate(SessionId([1; 32])).is_none());
+        let id = store.create(key(4));
+        clock.advance(IDLE);
+        assert!(store.authenticate(id).is_none());
+    }
+
+    #[test]
+    fn authed_session_debug_hides_id_and_key() {
+        let (_, store) = store();
+        let id = store.create(key(0xAB));
+        let session = store.authenticate(id.clone()).unwrap();
+        let debug = format!("{session:?}");
+        assert!(debug.contains(&id.log_id()), "{debug}");
+        assert!(!debug.to_lowercase().contains("abab"), "{debug}");
+        assert!(!debug.contains("171"), "{debug}");
+        assert!(!debug.contains(&id.to_cookie_value()), "{debug}");
     }
 
     #[tokio::test(start_paused = true)]

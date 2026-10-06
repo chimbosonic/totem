@@ -14,6 +14,7 @@ use crate::clock::Clock;
 use crate::oath::crypto::{self, DerivedKey};
 use crate::oath::proto::{self, Command, EntryState, ProtoError, SelectResponse};
 use crate::rng::ChallengeSource;
+use crate::session::AuthedSession;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ServiceError {
@@ -94,6 +95,11 @@ impl Service {
         })
     }
 
+    /// Whether the card is reachable and still password protected.
+    pub async fn health(&self) -> Result<(), ServiceError> {
+        todo!()
+    }
+
     /// Check `password` against the card and return the derived key.
     /// The password is wiped when this returns.
     pub async fn unlock(&self, password: Zeroizing<String>) -> Result<DerivedKey, ServiceError> {
@@ -107,11 +113,11 @@ impl Service {
         .ok_or(ServiceError::NoPassword)
     }
 
-    /// Unlock the card with `key` and list every credential.
-    pub async fn codes(&self, key: &DerivedKey) -> Result<Codes, ServiceError> {
+    /// Unlock the card with the session's key and list every credential.
+    pub async fn codes(&self, _session: &AuthedSession) -> Result<Codes, ServiceError> {
         let now = self.clock.now();
         let rng = self.rng.clone();
-        let key = key.clone();
+        let key: DerivedKey = todo!();
         let credentials = self
             .run(move |tx| {
                 if open(tx, rng.as_ref(), |_| key.clone())?.is_none() {
@@ -239,6 +245,7 @@ mod tests {
     use crate::clock::ManualClock;
     use crate::oath::crypto::{self, Algorithm};
     use crate::rng::SequentialChallengeSource;
+    use crate::session::SessionStore;
 
     const PASSWORD: &str = "correct horse";
     const SHA1_SEED: &[u8] = b"12345678901234567890";
@@ -282,6 +289,18 @@ mod tests {
 
     fn key() -> DerivedKey {
         crypto::derive_key(PASSWORD, &MockCard::DEFAULT_DEVICE_ID)
+    }
+
+    /// A live session holding `key`.
+    fn authed(key: DerivedKey) -> AuthedSession {
+        let store = SessionStore::new(
+            Arc::new(ManualClock::new(0)),
+            Arc::new(SequentialChallengeSource::new(0)),
+            300,
+            1800,
+        );
+        let id = store.create(key);
+        store.authenticate(id).unwrap()
     }
 
     fn ok(code: &str, digits: u8, period: u32, from: u64) -> CredentialState {
@@ -361,12 +380,39 @@ mod tests {
         assert_eq!(count(&card.events(), &MockEvent::Reconnect), 1);
     }
 
+    // Health
+
+    #[tokio::test]
+    async fn health_is_ok_when_card_reachable_and_protected() {
+        let card = rfc_card();
+        assert_eq!(service(&card, 59).health().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn health_fails_when_card_unreachable() {
+        let card = rfc_card();
+        card.fail_next(100, MockFault::NoCard);
+        assert_eq!(
+            service(&card, 59).health().await,
+            Err(ServiceError::Unavailable(CardError::NoCard))
+        );
+    }
+
+    #[tokio::test]
+    async fn health_fails_when_applet_unprotected() {
+        let card = MockCard::new();
+        assert_eq!(
+            service(&card, 59).health().await,
+            Err(ServiceError::NoPassword)
+        );
+    }
+
     // Codes
 
     #[tokio::test]
     async fn codes_match_rfc6238_for_fixed_clock() {
         let card = rfc_card();
-        let codes = service(&card, 59).codes(&key()).await.unwrap();
+        let codes = service(&card, 59).codes(&authed(key())).await.unwrap();
         assert_eq!(
             codes,
             Codes {
@@ -395,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn codes_run_select_validate_calculate_all_in_one_transaction() {
         let card = rfc_card();
-        service(&card, 59).codes(&key()).await.unwrap();
+        service(&card, 59).codes(&authed(key())).await.unwrap();
         let events = card.events();
         let ins: Vec<u8> = events
             .iter()
@@ -426,7 +472,7 @@ mod tests {
                 6,
                 SHA1_SEED,
             ));
-        let codes = service(&card, 59).codes(&key()).await.unwrap();
+        let codes = service(&card, 59).codes(&authed(key())).await.unwrap();
         // 30s: timestep 1 (RFC 4226 counter 1 = 287082).
         // 60s: timestep 0 (RFC 4226 counter 0 = 755224).
         assert_eq!(codes.credentials[0].state, ok("287082", 6, 30, 30));
@@ -452,7 +498,7 @@ mod tests {
                 6,
                 SHA1_SEED,
             ));
-        let codes = service(&card, 59).codes(&key()).await.unwrap();
+        let codes = service(&card, 59).codes(&authed(key())).await.unwrap();
         let states: Vec<_> = codes.credentials.iter().map(|c| c.state.clone()).collect();
         assert_eq!(
             states,
@@ -470,7 +516,7 @@ mod tests {
         let card = rfc_card();
         let stale = crypto::derive_key("old password", &MockCard::DEFAULT_DEVICE_ID);
         assert_eq!(
-            service(&card, 59).codes(&stale).await,
+            service(&card, 59).codes(&authed(stale)).await,
             Err(ServiceError::WrongPassword)
         );
     }
@@ -479,7 +525,7 @@ mod tests {
     async fn codes_refuse_applet_whose_password_was_removed() {
         let card = MockCard::new();
         assert_eq!(
-            service(&card, 59).codes(&key()).await,
+            service(&card, 59).codes(&authed(key())).await,
             Err(ServiceError::NoPassword)
         );
     }
@@ -490,7 +536,7 @@ mod tests {
     async fn card_removed_once_reconnects_and_retries() {
         let card = rfc_card();
         card.fail_next(1, MockFault::Removed);
-        let codes = service(&card, 59).codes(&key()).await.unwrap();
+        let codes = service(&card, 59).codes(&authed(key())).await.unwrap();
         assert_eq!(codes.credentials.len(), 3);
         let events = card.events();
         assert_eq!(count(&events, &MockEvent::Reconnect), 1);
@@ -502,7 +548,7 @@ mod tests {
         let card = rfc_card();
         card.fail_next(100, MockFault::Removed);
         assert_eq!(
-            service(&card, 59).codes(&key()).await,
+            service(&card, 59).codes(&authed(key())).await,
             Err(ServiceError::Unavailable(CardError::Removed))
         );
         let events = card.events();
@@ -532,7 +578,7 @@ mod tests {
     async fn protocol_errors_are_not_retried() {
         let card = rfc_card();
         let stale = crypto::derive_key("nope", &MockCard::DEFAULT_DEVICE_ID);
-        assert!(service(&card, 59).codes(&stale).await.is_err());
+        assert!(service(&card, 59).codes(&authed(stale)).await.is_err());
         assert_eq!(count(&card.events(), &MockEvent::Reconnect), 0);
     }
 
@@ -543,7 +589,7 @@ mod tests {
         let tasks: Vec<_> = (0..8)
             .map(|_| {
                 let svc = svc.clone();
-                tokio::spawn(async move { svc.codes(&key()).await })
+                tokio::spawn(async move { svc.codes(&authed(key())).await })
             })
             .collect();
         for task in tasks {

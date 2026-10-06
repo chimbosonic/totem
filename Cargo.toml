@@ -5,10 +5,14 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+dropshot = "0.17.1"
 getrandom = "0.4.3"
 hmac = "0.13.0"
+http = "1.5.0"
 ipnet = "2.12.2"
 pbkdf2 = "0.13.0"
+schemars = "0.8"
+serde = { version = "1.0.229", features = ["derive"] }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 slog = "2.8.2"
