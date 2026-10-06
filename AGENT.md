@@ -44,6 +44,8 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - Frontend tests: `node --test static/` (Node's built-in runner, no npm, no package.json).
 - Browser check (headless Chrome over CDP, script kept in the session scratchpad, not the repo): no CSP violations or JS errors in dark or light mode; screenshots looked right.
 - Container: Rancher Desktop provides Docker 29.5 at `~/.rd/bin/docker` (not on PATH by default; `export PATH="$HOME/.rd/bin:$PATH"`). The Rancher VM has no pcscd and cannot see the USB key, so the container can only be checked up to the reader error locally.
+- Run CI locally: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings && cargo test --locked && node --test static/ && python3 -m unittest discover -s ci`, then coverage: `cargo llvm-cov --locked --no-report && cargo llvm-cov report --json --summary-only --output-path cov.json --ignore-filename-regex '(card/pcsc\.rs|main\.rs|/tests/)' && python3 ci/coverage_gate.py cov.json`.
+- Lint the workflow: `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -no-color`.
 - Coverage gate excludes `card/pcsc.rs` and `main.rs`: `cargo llvm-cov --ignore-filename-regex '(card/pcsc\.rs|main\.rs)$'`.
 
 ## Manual hardware checklist (section 14.4) status
@@ -73,7 +75,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 12 | Real PC/SC card implementation | done | `card::pcsc::PcscCard`, `card::pick_reader`, `main` wiring, `tests/hardware.rs` (feature `hardware-tests`); 8 unit tests + 6 hardware tests |
 | 13 | Frontend | done | `static/{index.html,app.js,app.css}`, 13 JS tests (`node --test static/`), 7 Rust static-file rule tests, repo-wide em dash test |
 | 14 | Dockerfile and compose | done | `Dockerfile`, `.dockerignore`, `docker-compose.yml`, 7 rule tests (`tests/container.rs`) |
-| 15 | GitLab CI with coverage gate | todo | |
+| 15 | CI with coverage gate | done (**GitHub Actions**, not GitLab) | `.github/workflows/ci.yml`, `ci/coverage_gate.py` + 7 tests; actionlint clean; not yet run on GitHub |
 | 16 | README | todo | |
 
 ## Open questions and things to verify
@@ -164,6 +166,11 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: `.dockerignore` excludes `.env` (the OATH password), `.git`, `target`, `tests`, `openapi`, and docs.
 - 2026-10-06: Compose adds an `oath-headers` Traefik middleware (CSP, nosniff, frameDeny, no-referrer, `Cache-Control: no-store`) as the backstop for Dropshot-generated responses. `tests/container.rs` checks its CSP equals `api::security::CSP`. Also `build: .` so `docker compose up --build` works.
 - 2026-10-06: Possible deployment snag to document in the README: newer pcsc-lite builds on some hosts (Fedora, recent Ubuntu) authorise clients through polkit, which can deny a non-root container user even with the socket mounted.
+- 2026-10-06: CI is **GitHub Actions** (user's choice; PLAN.md section 15 says GitLab). Jobs: `check` (fmt, clippy `--all-features` so the hardware tests compile), `test`, `frontend` (`node --test`), `coverage`, `image`. Order: check, then test and frontend, then coverage, then image. The image goes to `ghcr.io/<owner lower case>/oath-web`, pushed only on `push` events (main, `v*` tags); PRs build without pushing. GHA build cache.
+- 2026-10-06: Coverage gate: cargo-llvm-cov only fails on totals, so `ci/coverage_gate.py` (stdlib only, unit tested) checks section 14.3 per group: `oath::*`, `session`, `ratelimit` at 95%, crate at 85%, after excluding `card/pcsc.rs`, `main.rs`, and `tests/`. A group with zero lines fails (catches a stale path rule). It writes a table to the job summary; Cobertura and JSON reports are uploaded as an artifact (GitHub has no built-in Cobertura view). Current: oath::* 99.75%, session 100%, ratelimit 100%, crate 99.46%.
+- 2026-10-06: Every third-party action is pinned to a full commit SHA with the release in a comment (looked up from the GitHub API on 2026-10-06). `persist-credentials: false` on checkout; default `permissions: contents: read`, with `packages: write` only for the image job.
+- 2026-10-06: Running the CI commands locally caught `tests/container.rs` not being rustfmt-formatted (written in step 14 without `cargo fmt`). Fixed in its own commit. Always run `cargo fmt` after writing Rust files.
+- 2026-10-06: Mistake: `ci/__pycache__/*.pyc` was committed with the gate (running the tests creates it). Removed from the index and `__pycache__/` added to `.gitignore`. Check `git status` before committing new tooling.
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
@@ -183,3 +190,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Step 13 done. 269 Rust tests and 13 JS tests green, fmt and clippy clean. Checked in headless Chrome against the real key: both views render in dark and light mode, codes and countdown work, no CSP violations.
 - 2026-10-06: Step 14 files written; 7 container rule tests green. Image build still to verify on a container runtime.
 - 2026-10-06: Built the image with Rancher Desktop (Docker 29.5.3, linux/aarch64): 1.5 min cold build, 34.5 MB image, runs as uid 10001, ships `libpcsclite1 1.9.9-2` and `ca-certificates` only (no curl). Run with `--read-only --cap-drop ALL --security-opt no-new-privileges:true` it logs JSON and exits 1 with the "no usable smart card reader" hint, as expected without pcscd. `docker compose config` validates the compose file and the CSP label resolves intact. Step 14 done.
+- 2026-10-06: Step 15 done: GitHub Actions workflow, actionlint clean, every command passes locally (277 Rust tests, 13 JS, 7 gate tests, coverage gate passes). Not run on GitHub yet: there is no remote.

@@ -2,3 +2,6 @@
 
 # Local secrets (OATH_HW_PASSWORD for hardware tests). Never commit.
 .env
+
+# Python bytecode from ci/ scripts.
+__pycache__/
