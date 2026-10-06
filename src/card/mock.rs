@@ -169,7 +169,9 @@ impl State {
         let theirs = find(data, TAG_CHALLENGE)?;
         let expected = crypto::hmac(Algorithm::Sha1, key.as_ref(), &challenge);
         if !crypto::constant_time_eq(&response, &expected) {
-            return Err(SW_NO_SUCH_OBJECT);
+            // What a real YubiKey NEO (applet 1.0.0) sends, rather than the
+            // 6984 the spec lists.
+            return Err(SW_WRONG_DATA);
         }
         self.unlocked = true;
         let mut out = Vec::new();

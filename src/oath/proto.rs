@@ -389,8 +389,14 @@ mod tests {
             status_error(Command::Select, 0x6A82),
             ProtoError::Status(0x6A82)
         );
+        // A YubiKey NEO (applet 1.0.0) answers a wrong VALIDATE with 6A80,
+        // not the 6984 the spec lists. ykman treats both as a wrong password.
         assert_eq!(
             status_error(Command::Validate, 0x6A80),
+            ProtoError::WrongPassword
+        );
+        assert_eq!(
+            status_error(Command::Calculate, 0x6A80),
             ProtoError::Status(0x6A80)
         );
     }
