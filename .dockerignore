@@ -1,0 +1,7 @@
+# Keep secrets and build output out of the build context.
+.env
+.git
+target
+openapi
+tests
+*.md
