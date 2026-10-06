@@ -27,7 +27,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - Credentials (as of 2026-10-06):
   - `RFC6238:sha256`: TOTP, SHA-256, 8 digits, 30s, RFC 6238 SHA-256 secret.
   - `60/RFC6238:sha256-60s`: same secret, SHA-256, 8 digits, **60s**.
-  - `RFC4226:sha1`: **HOTP**, SHA-1, 6 digits, RFC 4226 secret `12345678901234567890` (base32 `GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ`). Counter should still be 0: the first code ever generated must be `755224`.
+  - `RFC4226:sha1`: **HOTP**, SHA-1, 6 digits, RFC 4226 secret `12345678901234567890` (base32 `GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ`). Verified 2026-10-06: after all hardware tests and a real server run, the user's first `ykman oath accounts code RFC4226` gave `755224` (counter 0), so the service never advanced it. That check moved the counter to **1**; the next code is `287082`.
   - Touch-required: **not possible on this key**. `ykman` says "Require touch is not supported on this YubiKey" (the NEO's OATH applet is 1.0.0; touch needs a YubiKey 4.2.4 or newer). Touch handling is covered by the mock only.
 - Original credential note: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user confirmed it uses the RFC 6238 SHA-256 test secret `12345678901234567890123456789012` (ASCII, 32 bytes), so expected codes can be checked against the RFC 6238 Appendix B vectors as well as `ykman oath accounts code`. Verified 2026-10-06: SHA-256, **8 digits**, 30s period; `ykman` code matched an independent Python computation.
 - Device ID (PBKDF2 salt, not secret): `4d17581a446ffed1`.
@@ -166,3 +166,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: With the key password-protected, all 6 hardware tests pass after fixing the `6A80` bug. Smoke-tested the real binary against the key with curl: healthz 200, wrong password 401 then 429 (`Retry-After: 1`), unlock 204 + cookie, codes OK, lock 204, codes after lock 401, SIGTERM exit 0, log free of the password.
 - 2026-10-06: Added `hw_pbkdf2_matches_independent_fixture`; fixture computed into `.env` without printing it. All 7 hardware tests pass.
 - 2026-10-06: User added a 60s TOTP and an HOTP (touch unsupported on the NEO). Added two hardware tests; all 9 pass. Every YKOATH command we use (SELECT, VALIDATE, CALCULATE ALL, CALCULATE) is now verified on the real key.
+- 2026-10-06: HOTP counter confirmed untouched by the service (`755224` on first manual read). Counter is now 1.
