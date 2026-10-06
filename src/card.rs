@@ -2,6 +2,7 @@
 //! [`mock::MockCard`] for tests.
 
 pub mod mock;
+pub mod pcsc;
 
 use crate::oath::proto::{self, Command, ProtoError};
 
@@ -40,6 +41,12 @@ pub trait OathCard: Send {
     fn reconnect(&mut self) -> Result<(), CardError>;
 }
 
+/// Pick a reader: the first whose name contains `filter`, or without a
+/// filter the first containing "YubiKey". Matching ignores case.
+pub fn pick_reader<'a>(_readers: &'a [String], _filter: Option<&str>) -> Option<&'a str> {
+    todo!()
+}
+
 /// Send `apdu`, follow SEND REMAINING chaining, and return the response
 /// data if the final status is success.
 pub fn send(
@@ -75,6 +82,41 @@ mod tests {
             responses: responses.into(),
             sent: Vec::new(),
         }
+    }
+
+    fn readers(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn pick_reader_defaults_to_first_yubikey() {
+        let list = readers(&[
+            "Generic Reader",
+            "Yubico YubiKey OTP+FIDO+CCID",
+            "Yubico YubiKey NEO",
+        ]);
+        assert_eq!(
+            pick_reader(&list, None),
+            Some("Yubico YubiKey OTP+FIDO+CCID")
+        );
+    }
+
+    #[test]
+    fn pick_reader_uses_filter_substring_ignoring_case() {
+        let list = readers(&["Yubico YubiKey OTP+FIDO+CCID", "Yubico YubiKey NEO"]);
+        assert_eq!(pick_reader(&list, Some("neo")), Some("Yubico YubiKey NEO"));
+    }
+
+    #[test]
+    fn pick_reader_with_unmatched_filter_finds_nothing() {
+        let list = readers(&["Yubico YubiKey NEO"]);
+        assert_eq!(pick_reader(&list, Some("Nitrokey")), None);
+    }
+
+    #[test]
+    fn pick_reader_without_yubikey_finds_nothing() {
+        assert_eq!(pick_reader(&readers(&["Generic Reader"]), None), None);
+        assert_eq!(pick_reader(&[], None), None);
     }
 
     #[test]

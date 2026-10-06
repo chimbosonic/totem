@@ -39,6 +39,13 @@ pub struct CardInfo {
     pub version: Vec<u8>,
 }
 
+impl CardInfo {
+    /// Applet version as dotted decimal, for example `5.7.0`.
+    pub fn version_string(&self) -> String {
+        todo!()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Codes {
     pub generated_at: u64,
@@ -340,6 +347,17 @@ mod tests {
             service(&card, 59).startup_check().await,
             Err(ServiceError::NoPassword)
         );
+    }
+
+    #[test]
+    fn version_string_is_dotted_decimal() {
+        let info = |v: &[u8]| CardInfo {
+            version: v.to_vec(),
+        };
+        assert_eq!(info(&[5, 7, 0]).version_string(), "5.7.0");
+        assert_eq!(info(&[1, 0, 0]).version_string(), "1.0.0");
+        assert_eq!(info(&[12]).version_string(), "12");
+        assert_eq!(info(&[]).version_string(), "");
     }
 
     // Unlock
