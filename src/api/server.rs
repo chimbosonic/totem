@@ -5,10 +5,19 @@ use std::sync::Arc;
 
 use dropshot::{
     ApiDescription, Body, ConfigDropshot, HandlerTaskMode, HttpError, HttpResponseHeaders,
-    HttpResponseOk, HttpServer, RequestContext, ServerBuilder, TypedBody,
+    HttpResponseOk, HttpResponseUpdatedNoContent, HttpServer, RequestContext, ServerBuilder,
+    TypedBody,
 };
-use http::Response;
-use slog::Logger;
+use http::header::{CONTENT_TYPE, SET_COOKIE};
+use http::{HeaderValue, Response, StatusCode};
+use slog::{Logger, error, info, warn};
+use zeroize::Zeroizing;
+
+use super::auth::{
+    acquire_unlock_attempt, clear_session_cookie, client_ip, require_session, session_cookie,
+};
+use super::security::{RespKind, require_json, secure_result};
+use crate::service::ServiceError;
 
 use super::definition::{
     CodesResponse, HealthResponse, NoContent, OathApi, UnlockRequest, oath_api_mod,
@@ -41,40 +50,172 @@ impl OathApi for OathApiImpl {
     type Context = ApiContext;
 
     async fn unlock(
-        _rqctx: RequestContext<ApiContext>,
-        _body: TypedBody<UnlockRequest>,
+        rqctx: RequestContext<ApiContext>,
+        body: TypedBody<UnlockRequest>,
     ) -> Result<NoContent, HttpError> {
-        todo!()
+        secure_result(unlock(&rqctx, body).await, RespKind::Api)
     }
 
-    async fn lock(_rqctx: RequestContext<ApiContext>) -> Result<NoContent, HttpError> {
-        todo!()
+    async fn lock(rqctx: RequestContext<ApiContext>) -> Result<NoContent, HttpError> {
+        secure_result(lock(&rqctx).await, RespKind::Api)
     }
 
     async fn codes(
-        _rqctx: RequestContext<ApiContext>,
+        rqctx: RequestContext<ApiContext>,
     ) -> Result<HttpResponseHeaders<HttpResponseOk<CodesResponse>>, HttpError> {
-        todo!()
+        secure_result(codes(&rqctx).await, RespKind::Api)
     }
 
     async fn healthz(
-        _rqctx: RequestContext<ApiContext>,
+        rqctx: RequestContext<ApiContext>,
     ) -> Result<HttpResponseHeaders<HttpResponseOk<HealthResponse>>, HttpError> {
-        todo!()
+        secure_result(healthz(&rqctx).await, RespKind::Api)
     }
 
     async fn index(_rqctx: RequestContext<ApiContext>) -> Result<Response<Body>, HttpError> {
-        let _ = (INDEX_HTML, APP_JS, APP_CSS);
-        todo!()
+        secure_result(
+            static_file("text/html; charset=utf-8", INDEX_HTML),
+            RespKind::Static,
+        )
     }
 
     async fn app_js(_rqctx: RequestContext<ApiContext>) -> Result<Response<Body>, HttpError> {
-        todo!()
+        secure_result(
+            static_file("text/javascript; charset=utf-8", APP_JS),
+            RespKind::Static,
+        )
     }
 
     async fn app_css(_rqctx: RequestContext<ApiContext>) -> Result<Response<Body>, HttpError> {
-        todo!()
+        secure_result(
+            static_file("text/css; charset=utf-8", APP_CSS),
+            RespKind::Static,
+        )
     }
+}
+
+async fn unlock(
+    rqctx: &RequestContext<ApiContext>,
+    body: TypedBody<UnlockRequest>,
+) -> Result<NoContent, HttpError> {
+    require_json(rqctx.request.headers())?;
+    let ctx = rqctx.context();
+    let permit = acquire_unlock_attempt(rqctx).await?;
+    let ip = permit.ip();
+    let password = Zeroizing::new(body.into_inner().password);
+
+    match ctx.service.unlock(password).await {
+        Ok(key) => {
+            permit.success();
+            let id = ctx.sessions.create(key);
+            info!(rqctx.log, "unlock succeeded";
+                "event" => "unlock_success",
+                "client_ip" => %ip,
+                "session" => id.log_id(),
+            );
+            with_cookie(session_cookie(&id))
+        }
+        Err(ServiceError::WrongPassword) => {
+            let outcome = permit.failure();
+            warn!(rqctx.log, "unlock failed";
+                "event" => "unlock_failure",
+                "client_ip" => %ip,
+                "backoff_secs" => outcome.backoff,
+            );
+            if outcome.global_lockout_engaged {
+                warn!(rqctx.log, "global unlock lockout engaged";
+                    "event" => "global_lockout_engaged",
+                );
+            }
+            Err(ServiceError::WrongPassword.into())
+        }
+        Err(other) => {
+            // Never reached the password check, so record nothing.
+            drop(permit);
+            Err(card_error(&rqctx.log, other))
+        }
+    }
+}
+
+async fn lock(rqctx: &RequestContext<ApiContext>) -> Result<NoContent, HttpError> {
+    require_json(rqctx.request.headers())?;
+    let session = require_session(rqctx).await?;
+    rqctx.context().sessions.remove(session.id());
+    info!(rqctx.log, "session locked";
+        "event" => "lock",
+        "client_ip" => %client_ip(rqctx),
+        "session" => session.log_id(),
+    );
+    with_cookie(clear_session_cookie())
+}
+
+async fn codes(
+    rqctx: &RequestContext<ApiContext>,
+) -> Result<HttpResponseHeaders<HttpResponseOk<CodesResponse>>, HttpError> {
+    let ctx = rqctx.context();
+    let session = require_session(rqctx).await?;
+    let codes = match ctx.service.codes(&session).await {
+        Ok(codes) => codes,
+        Err(ServiceError::WrongPassword) => {
+            // The password changed since unlock; this session is useless now.
+            ctx.sessions.remove(session.id());
+            return Err(ServiceError::WrongPassword.into());
+        }
+        Err(other) => return Err(card_error(&rqctx.log, other)),
+    };
+    info!(rqctx.log, "codes fetched";
+        "event" => "codes_fetched",
+        "client_ip" => %client_ip(rqctx),
+        "session" => session.log_id(),
+        "count" => codes.credentials.len(),
+    );
+    Ok(HttpResponseHeaders::new_unnamed(HttpResponseOk(
+        codes.into(),
+    )))
+}
+
+async fn healthz(
+    rqctx: &RequestContext<ApiContext>,
+) -> Result<HttpResponseHeaders<HttpResponseOk<HealthResponse>>, HttpError> {
+    rqctx.context().service.health().await?;
+    Ok(HttpResponseHeaders::new_unnamed(HttpResponseOk(
+        HealthResponse {
+            status: "ok".into(),
+        },
+    )))
+}
+
+/// Log a card problem as an audit event and turn it into the HTTP error.
+fn card_error(log: &Logger, error: ServiceError) -> HttpError {
+    let reconnect_attempted = matches!(
+        error,
+        ServiceError::Unavailable(_) | ServiceError::CardAuthFailed
+    );
+    error!(log, "card error";
+        "event" => "card_error",
+        "kind" => %error,
+        "reconnect_attempted" => reconnect_attempted,
+    );
+    error.into()
+}
+
+fn with_cookie(cookie: String) -> Result<NoContent, HttpError> {
+    let value = HeaderValue::try_from(cookie)
+        .map_err(|e| HttpError::for_internal_error(format!("bad cookie header: {e}")))?;
+    let mut response = HttpResponseHeaders::new_unnamed(HttpResponseUpdatedNoContent());
+    response.headers_mut().insert(SET_COOKIE, value);
+    Ok(response)
+}
+
+fn static_file(
+    content_type: &'static str,
+    body: &'static str,
+) -> Result<Response<Body>, HttpError> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .map_err(|e| HttpError::for_internal_error(e.to_string()))
 }
 
 /// The API description with the real handlers.
@@ -84,22 +225,34 @@ pub fn api() -> ApiDescription<ApiContext> {
 
 /// The OpenAPI document, pretty-printed, generated without a card.
 pub fn openapi_json() -> String {
-    todo!()
+    let description = oath_api_mod::stub_api_description().expect("API description is valid");
+    let version = dropshot::semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("crate version is semver");
+    let mut openapi = description.openapi("oath-web", version);
+    openapi.description("Read TOTP codes from a YubiKey OATH applet.");
+    let value = openapi.json().expect("OpenAPI serialises");
+    let mut out = serde_json::to_string_pretty(&value).expect("JSON serialises");
+    out.push('\n');
+    out
 }
 
 /// Start the HTTP server on `bind`.
 pub fn start(
-    _context: ApiContext,
-    _bind: SocketAddr,
-    _log: Logger,
+    context: ApiContext,
+    bind: SocketAddr,
+    log: Logger,
 ) -> Result<HttpServer<ApiContext>, dropshot::BuildError> {
-    let _ = (
-        ConfigDropshot::default(),
-        HandlerTaskMode::Detached,
-        ServerBuilder::<ApiContext>::new,
-        REQUEST_BODY_MAX_BYTES,
-    );
-    todo!()
+    let config = ConfigDropshot {
+        bind_address: bind,
+        default_request_body_max_bytes: REQUEST_BODY_MAX_BYTES,
+        // Let unlock attempts finish even if the client disconnects, so a
+        // failure is always recorded against the rate limit.
+        default_handler_task_mode: HandlerTaskMode::Detached,
+        ..ConfigDropshot::default()
+    };
+    ServerBuilder::new(api(), context, log)
+        .config(config)
+        .start()
 }
 
 #[cfg(test)]

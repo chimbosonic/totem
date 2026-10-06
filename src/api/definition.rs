@@ -53,9 +53,38 @@ pub enum CredentialStatus {
 }
 
 impl From<Codes> for CodesResponse {
-    fn from(_codes: Codes) -> Self {
-        let _ = (Credential::clone, CredentialState::clone);
-        todo!()
+    fn from(codes: Codes) -> Self {
+        Self {
+            generated_at: codes.generated_at,
+            credentials: codes.credentials.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<Credential> for CredentialView {
+    fn from(credential: Credential) -> Self {
+        let status = match credential.state {
+            CredentialState::Ok {
+                code,
+                digits,
+                period,
+                valid_from,
+                valid_until,
+            } => CredentialStatus::Ok {
+                code,
+                digits,
+                period,
+                valid_from,
+                valid_until,
+            },
+            CredentialState::TouchRequired => CredentialStatus::TouchRequired,
+            CredentialState::Hotp => CredentialStatus::Hotp,
+        };
+        Self {
+            issuer: credential.issuer,
+            account: credential.account,
+            status,
+        }
     }
 }
 

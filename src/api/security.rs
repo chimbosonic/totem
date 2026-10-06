@@ -30,16 +30,14 @@ pub enum RespKind {
 }
 
 /// Add the security headers for `kind`, replacing any existing values.
-pub fn apply_security_headers(_headers: &mut HeaderMap, _kind: RespKind) {
-    let _ = (
-        CACHE_CONTROL,
-        CONTENT_SECURITY_POLICY,
-        REFERRER_POLICY,
-        X_CONTENT_TYPE_OPTIONS,
-        X_FRAME_OPTIONS,
-        HeaderValue::from_static(CSP),
-    );
-    todo!()
+pub fn apply_security_headers(headers: &mut HeaderMap, kind: RespKind) {
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    if kind == RespKind::Api {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
 }
 
 /// Anything that can carry response headers.
@@ -70,24 +68,35 @@ impl Secure for HttpError {
 }
 
 /// Apply the security headers to a response or error.
-pub fn secure<T: Secure>(_value: T, _kind: RespKind) -> T {
-    todo!()
+pub fn secure<T: Secure>(mut value: T, kind: RespKind) -> T {
+    apply_security_headers(value.header_map(), kind);
+    value
 }
 
 /// Apply the security headers to whichever side of `result` is present.
 pub fn secure_result<T: Secure>(
-    _result: Result<T, HttpError>,
-    _kind: RespKind,
+    result: Result<T, HttpError>,
+    kind: RespKind,
 ) -> Result<T, HttpError> {
-    todo!()
+    result
+        .map(|ok| secure(ok, kind))
+        .map_err(|err| secure(err, kind))
 }
 
 /// Require `Content-Type: application/json` (parameters such as charset
 /// allowed). Dropshot's `TypedBody` treats a missing content type as JSON and
 /// also accepts `application/*+json`, so POST handlers check explicitly.
-pub fn require_json(_headers: &HeaderMap) -> Result<(), HttpError> {
-    let _ = CONTENT_TYPE;
-    todo!()
+pub fn require_json(headers: &HeaderMap) -> Result<(), HttpError> {
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or_default().trim())
+        .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json"));
+    if is_json {
+        Ok(())
+    } else {
+        Err(super::errors::bad_content_type())
+    }
 }
 
 #[cfg(test)]

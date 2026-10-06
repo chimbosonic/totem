@@ -1,0 +1,272 @@
+{
+  "components": {
+    "responses": {
+      "Error": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        },
+        "description": "Error"
+      }
+    },
+    "schemas": {
+      "CodesResponse": {
+        "properties": {
+          "credentials": {
+            "items": {
+              "$ref": "#/components/schemas/CredentialView"
+            },
+            "type": "array"
+          },
+          "generated_at": {
+            "description": "Unix time the codes were computed at.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "credentials",
+          "generated_at"
+        ],
+        "type": "object"
+      },
+      "CredentialView": {
+        "oneOf": [
+          {
+            "description": "A TOTP code valid from `valid_from` (inclusive) to `valid_until` (exclusive), both Unix times.",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "digits": {
+                "format": "uint8",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "period": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "enum": [
+                  "ok"
+                ],
+                "type": "string"
+              },
+              "valid_from": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "valid_until": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "digits",
+              "period",
+              "status",
+              "valid_from",
+              "valid_until"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The credential needs a touch on the key, so no code is computed.",
+            "properties": {
+              "status": {
+                "enum": [
+                  "touch_required"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "HOTP credentials are listed but never computed.",
+            "properties": {
+              "status": {
+                "enum": [
+                  "hotp"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          }
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account",
+          "issuer"
+        ],
+        "type": "object"
+      },
+      "Error": {
+        "description": "Error information from a response.",
+        "properties": {
+          "error_code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "request_id"
+        ],
+        "type": "object"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "UnlockRequest": {
+        "description": "Unlock request. Deliberately has no `Debug`, so the password cannot end up in a log by accident.",
+        "properties": {
+          "password": {
+            "description": "The OATH password set on the YubiKey.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "password"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Read TOTP codes from a YubiKey OATH applet.",
+    "title": "oath-web",
+    "version": "0.1.0"
+  },
+  "openapi": "3.0.3",
+  "paths": {
+    "/api/codes": {
+      "get": {
+        "operationId": "codes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodesResponse"
+                }
+              }
+            },
+            "description": "successful operation"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List every credential, with codes for those that can be computed."
+      }
+    },
+    "/api/lock": {
+      "post": {
+        "operationId": "lock",
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "End the current session."
+      }
+    },
+    "/api/unlock": {
+      "post": {
+        "operationId": "unlock",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnlockRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Unlock with the OATH password and start a session."
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "successful operation"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Whether the card is reachable and password protected."
+      }
+    }
+  }
+}

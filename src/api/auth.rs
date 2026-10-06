@@ -10,6 +10,7 @@ use http::HeaderMap;
 use http::header::COOKIE;
 use ipnet::IpNet;
 
+use super::errors;
 use super::server::ApiContext;
 use crate::ratelimit::{self, RateLimiter, UnlockPermit};
 use crate::session::{AuthedSession, SessionId, SessionStore};
@@ -19,28 +20,38 @@ const COOKIE_ATTRIBUTES: &str = "HttpOnly; Secure; SameSite=Strict; Path=/";
 const FORWARDED_FOR: &str = "x-forwarded-for";
 
 /// `Set-Cookie` value that starts a session.
-pub fn session_cookie(_id: &SessionId) -> String {
-    let _ = COOKIE_ATTRIBUTES;
-    todo!()
+pub fn session_cookie(id: &SessionId) -> String {
+    format!(
+        "{COOKIE_NAME}={}; {COOKIE_ATTRIBUTES}",
+        id.to_cookie_value()
+    )
 }
 
 /// `Set-Cookie` value that removes the session cookie.
 pub fn clear_session_cookie() -> String {
-    todo!()
+    format!("{COOKIE_NAME}=; Max-Age=0; {COOKIE_ATTRIBUTES}")
 }
 
 /// The first well-formed `oath_session` value in the `Cookie` headers.
-pub fn session_id_from_headers(_headers: &HeaderMap) -> Option<SessionId> {
-    let _ = COOKIE;
-    todo!()
+pub fn session_id_from_headers(headers: &HeaderMap) -> Option<SessionId> {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter(|(name, _)| *name == COOKIE_NAME)
+        .find_map(|(_, value)| SessionId::from_cookie_value(value))
 }
 
 /// Look up the request's session, refreshing its idle timeout.
 pub fn session_from_headers(
-    _sessions: &SessionStore,
-    _headers: &HeaderMap,
+    sessions: &SessionStore,
+    headers: &HeaderMap,
 ) -> Result<AuthedSession, HttpError> {
-    todo!()
+    session_id_from_headers(headers)
+        .and_then(|id| sessions.authenticate(id))
+        .ok_or_else(errors::no_session)
 }
 
 pub async fn require_session(
@@ -50,9 +61,18 @@ pub async fn require_session(
 }
 
 /// Client IP from the peer address and any `X-Forwarded-For` headers.
-pub fn client_ip_from(_trusted: &[IpNet], _peer: IpAddr, _headers: &HeaderMap) -> IpAddr {
-    let _ = (FORWARDED_FOR, ratelimit::client_ip);
-    todo!()
+pub fn client_ip_from(trusted: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+    let values: Option<Vec<&str>> = headers
+        .get_all(FORWARDED_FOR)
+        .iter()
+        .map(|value| value.to_str().ok())
+        .collect();
+    match values {
+        // A header we cannot read is treated like one we cannot parse.
+        None => ratelimit::client_ip(peer, Some(""), trusted),
+        Some(values) if values.is_empty() => ratelimit::client_ip(peer, None, trusted),
+        Some(values) => ratelimit::client_ip(peer, Some(&values.join(",")), trusted),
+    }
 }
 
 pub fn client_ip(rqctx: &RequestContext<ApiContext>) -> IpAddr {
@@ -65,10 +85,10 @@ pub fn client_ip(rqctx: &RequestContext<ApiContext>) -> IpAddr {
 
 /// Reserve an unlock attempt for `ip`, or a 429.
 pub fn acquire_unlock_attempt_for(
-    _limiter: &RateLimiter,
-    _ip: IpAddr,
+    limiter: &RateLimiter,
+    ip: IpAddr,
 ) -> Result<UnlockPermit<'_>, HttpError> {
-    todo!()
+    limiter.acquire(ip).map_err(errors::too_many_attempts)
 }
 
 pub async fn acquire_unlock_attempt(

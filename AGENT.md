@@ -43,7 +43,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 8 | `service` | done | `Service::{startup_check, unlock, codes}`, retry/reconnect, serialisation, 19 tests (+1 mock test) |
 | 9 | `session` | done | `SessionStore::{create, touch, remove, purge}`, `SessionId` (hex cookie, redacted Debug, `log_id`), `spawn_purger`, 17 tests |
 | 10 | `ratelimit` | done | `RateLimiter::acquire` -> `UnlockPermit::{success, failure}`, `Denied`, `client_ip`, 26 tests |
-| 11 | `api` (Dropshot) | todo | |
+| 11 | `api` (Dropshot) | done | API trait (`api::definition`), handlers (`api::server`), `auth`, `security`, `errors`, OpenAPI snapshot, 55 tests (+7 session/service) |
 | 12 | Real PC/SC card implementation | todo | |
 | 13 | Frontend | todo | |
 | 14 | Dockerfile and compose | todo | |
@@ -54,9 +54,9 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 
 - YKOATH bytes in section 5 were written from the Yubico spec as recalled, not fetched. Confirm on hardware in step 12: SELECT/CALCULATE ALL round trip on the NEO, and that APDUs without Le are accepted (ykman style).
 - Which status word does the NEO return for a wrong VALIDATE? Spec says `6984` (mapped to `WrongPassword`). `6A80` currently maps to a generic `Status` error. Needs a password set on the key to check.
-- Dropshot: which response types allow custom headers (cookies, `Retry-After`)?
-- Dropshot: can `HttpError` carry `Retry-After` for 429?
-- Dropshot: behaviour of `TypedBody` on non-JSON `Content-Type`.
+- ~~Dropshot: which response types allow custom headers?~~ Resolved: `HttpResponseHeaders<T>::headers_mut()` (keeps typed OpenAPI) and `Response<Body>`.
+- ~~Dropshot: can `HttpError` carry `Retry-After` for 429?~~ Resolved: yes, `HttpError.headers` / `headers_mut()`; applied when rendered.
+- ~~Dropshot: `TypedBody` on non-JSON `Content-Type`?~~ Resolved: a missing `Content-Type` is treated as JSON, `application/*+json` is accepted, other types get 400. So POST handlers call `security::require_json` (400 too, for one consistent status).
 - PBKDF2 fixture from a real key is pending the manual hardware checklist (section 14.4).
 
 ## Decisions log
@@ -108,6 +108,20 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Global lockout engages on the Nth failure within 15 minutes (N = `OATH_GLOBAL_FAIL_LIMIT`). PLAN.md section 8 says "more than N" but section 11 says "failures before global lockout"; chose the stricter reading. The failure list is cleared when a lockout engages.
 - 2026-10-06: Per-IP history is forgotten 15 minutes after its backoff ends (pruned on each `acquire`), so the map cannot grow without bound. An IP that waits that long starts again at 1s.
 - 2026-10-06: `client_ip`: X-Forwarded-For is used only when the direct peer is trusted; the right-most entry that is not itself a trusted proxy is the client (left-most if all are trusted). Any unparseable entry (including `ip:port`) falls back to the peer. IPv4-mapped IPv6 addresses are canonicalised.
+- 2026-10-06: Dropshot 0.17.1 (source read in `~/.cargo/registry`). It depends on schemars **0.8**, so schemars is pinned to 0.8; 1.x types would not satisfy its `JsonSchema` bound.
+- 2026-10-06: Security headers gap: Dropshot cannot add headers to responses it generates itself: unknown route 404/405 (router runs before any handler) and `TypedBody` extractor 400s (bad JSON, wrong content type, body over 1024 bytes). A custom error type does not help: `HttpResponseContent` needs `ApiSchemaGenerator`, which is not exported, and the blanket JSON impl cannot set headers. Every handler-produced response (success and error) goes through `security::secure_result`, enforced by `every_endpoint_returns_security_headers`. Backstop: a Traefik `headers` middleware in the compose file (step 14). These framework responses contain no secrets.
+- 2026-10-06: CSP is `default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'` plus `X-Frame-Options: DENY`; stricter than PLAN.md's minimum. `Cache-Control: no-store` on `/api/*` and `/healthz`.
+- 2026-10-06: `AuthedSession` lives in `session` (not `api`) so `service` can require it without depending on `api`. Only `SessionStore::authenticate` builds one; its key accessor is `pub(crate)`.
+- 2026-10-06: `ApiContext` is `{ service, sessions, ratelimit, config }`. PLAN.md also lists `clock` and `rng`, but every user of them already holds its own `Arc`, so they were left out rather than kept as unused fields.
+- 2026-10-06: Testability split for the 9a helpers: each `RequestContext` function (`require_session`, `client_ip`, `acquire_unlock_attempt`) is a one-line wrapper over a pure function (`session_from_headers`, `client_ip_from`, `acquire_unlock_attempt_for`) that is unit tested. A `RequestContext` cannot be built in a unit test.
+- 2026-10-06: Unlock flow: `require_json`, then permit (429 before touching the card), then `service.unlock`. A wrong password records a failure; a card error drops the permit (no record) and logs `card_error`. Server uses `HandlerTaskMode::Detached` so a client disconnect cannot cancel an unlock before its failure is recorded.
+- 2026-10-06: `/api/codes` returning `WrongPassword` (password changed since unlock) removes the session and returns 401, so the frontend falls back to the locked view.
+- 2026-10-06: Status mapping: `WrongPassword` and no session are 401; `NoPassword`, `CardAuthFailed`, `Unavailable`, and `Protocol` are 503 with external message `card unavailable` (details only in the internal message, which goes to the log); `Internal` is 500. Bad content type is 400; rate limit is 429 + `Retry-After`.
+- 2026-10-06: Session cookie: `oath_session=<64 hex>; HttpOnly; Secure; SameSite=Strict; Path=/` with no Max-Age (server-side TTLs rule). Lock sends the same attributes with `Max-Age=0`.
+- 2026-10-06: `UnlockRequest` deliberately has no `Debug`. The password moves straight into `Zeroizing<String>`; the raw request bytes inside Dropshot/hyper are not zeroized (outside our control).
+- 2026-10-06: OpenAPI is generated by `api::server::openapi_json()` from `stub_api_description()` and committed as `openapi/oath-web.json`; regenerate with `EXPECTORATE=overwrite cargo test openapi_matches`. The 2 "ignored" doctests in `cargo test` output come from docs generated by the `#[dropshot::api_description]` macro, not from our code.
+- 2026-10-06: API tests run a real Dropshot server on `127.0.0.1:0` with `reqwest` (no default features). Logs are captured with a synchronous slog JSON drain over `logging::test_support::SharedBuf`, so tests can read them after `server.close()`.
+- 2026-10-06: Static files are placeholders in `static/` (embedded with `include_str!`) until step 13. `main` is not wired to the server yet; that comes with the real PC/SC card in step 12.
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
@@ -118,3 +132,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Step 8 done. 150 tests green, fmt and clippy clean. `service.rs` 99% line coverage; crate total 98.9%. Found a bug before committing (a protocol error on the retry was reported as `Unavailable`); reproduced it with `wrong_password_on_retry_is_still_wrong_password` first, then fixed it.
 - 2026-10-06: Step 9 done. 167 tests green, fmt and clippy clean. `session.rs` 100% line coverage; crate total 99%. Found that `u8::from_str_radix` accepts a leading `+`, so `+a+a...` parsed as a session cookie; reproduced with a test, then fixed.
 - 2026-10-06: Step 10 done. 193 tests green, fmt and clippy clean. `ratelimit.rs` 100% line coverage; crate total 99%. Three tests had setup bugs (global limit too low for per-IP tests, one wrong clock step); fixed the tests, code unchanged.
+- 2026-10-06: Step 11 done. 255 tests green, fmt and clippy clean. Coverage 98.8% lines overall; every `api/*` file 100% except `server.rs` 98.9%. Read Dropshot 0.17.1 source to answer the section 9a questions (see Open questions and Decisions).

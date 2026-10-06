@@ -4,33 +4,68 @@
 //! The detail goes in the internal message, which only reaches the log.
 
 use dropshot::{ClientErrorStatusCode, ErrorStatusCode, HttpError};
+use http::HeaderValue;
+use http::header::RETRY_AFTER;
 
 use crate::ratelimit::Denied;
 use crate::service::ServiceError;
 
 impl From<ServiceError> for HttpError {
-    fn from(_error: ServiceError) -> Self {
-        todo!()
+    fn from(error: ServiceError) -> Self {
+        match error {
+            ServiceError::WrongPassword => client_error(
+                ClientErrorStatusCode::UNAUTHORIZED,
+                "WrongPassword",
+                "wrong password",
+            ),
+            ServiceError::NoPassword
+            | ServiceError::CardAuthFailed
+            | ServiceError::Unavailable(_)
+            | ServiceError::Protocol(_) => HttpError {
+                status_code: ErrorStatusCode::SERVICE_UNAVAILABLE,
+                error_code: Some("CardUnavailable".into()),
+                external_message: "card unavailable".into(),
+                internal_message: error.to_string(),
+                headers: None,
+            },
+            ServiceError::Internal => HttpError::for_internal_error(error.to_string()),
+        }
     }
+}
+
+fn client_error(status: ClientErrorStatusCode, code: &str, message: &str) -> HttpError {
+    HttpError::for_client_error(Some(code.into()), status, message.into())
 }
 
 /// 401 for a missing, unknown, or expired session.
 pub fn no_session() -> HttpError {
-    let _ = (
+    client_error(
         ClientErrorStatusCode::UNAUTHORIZED,
-        ErrorStatusCode::SERVICE_UNAVAILABLE,
-    );
-    todo!()
+        "NoSession",
+        "no valid session",
+    )
 }
 
 /// 429 with `Retry-After`.
-pub fn too_many_attempts(_denied: Denied) -> HttpError {
-    todo!()
+pub fn too_many_attempts(denied: Denied) -> HttpError {
+    let mut error = client_error(
+        ClientErrorStatusCode::TOO_MANY_REQUESTS,
+        "TooManyAttempts",
+        "too many unlock attempts",
+    );
+    error
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(denied.retry_after()));
+    error
 }
 
 /// 400 for a POST without `Content-Type: application/json`.
 pub fn bad_content_type() -> HttpError {
-    todo!()
+    client_error(
+        ClientErrorStatusCode::BAD_REQUEST,
+        "BadContentType",
+        "expected Content-Type: application/json",
+    )
 }
 
 #[cfg(test)]
