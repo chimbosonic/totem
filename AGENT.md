@@ -41,10 +41,10 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - Hardware tests (never part of plain `cargo test`):
   - `cargo test --features hardware-tests --test hardware -- --test-threads=1` (unprotected key: 5 pass, the unlock test fails asking for `OATH_HW_PASSWORD`).
   - `OATH_HW_PASSWORD='...' cargo test --features hardware-tests --test hardware -- --test-threads=1` (protected key: unlock, wrong password, codes).
-- Frontend tests: `node --test static/` (Node's built-in runner, no npm, no package.json).
+- Frontend tests: `node --test "static/*.test.js"` (Node's built-in runner, no npm, no package.json).
 - Browser check (headless Chrome over CDP, script kept in the session scratchpad, not the repo): no CSP violations or JS errors in dark or light mode; screenshots looked right.
 - Container: Rancher Desktop provides Docker 29.5 at `~/.rd/bin/docker` (not on PATH by default; `export PATH="$HOME/.rd/bin:$PATH"`). The Rancher VM has no pcscd and cannot see the USB key, so the container can only be checked up to the reader error locally.
-- Run CI locally: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings && cargo test --locked && node --test static/ && python3 -m unittest discover -s ci`, then coverage: `cargo llvm-cov --locked --no-report && cargo llvm-cov report --json --summary-only --output-path cov.json --ignore-filename-regex '(card/pcsc\.rs|main\.rs|/tests/)' && python3 ci/coverage_gate.py cov.json`.
+- Run CI locally: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings && cargo test --locked && node --test "static/*.test.js" && python3 -m unittest discover -s ci`, then coverage: `cargo llvm-cov --locked --no-report && cargo llvm-cov report --json --summary-only --output-path cov.json --ignore-filename-regex '(card/pcsc\.rs|main\.rs|/tests/)' && python3 ci/coverage_gate.py cov.json`.
 - Lint the workflow: `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -no-color`.
 - Coverage gate excludes `card/pcsc.rs` and `main.rs`: `cargo llvm-cov --ignore-filename-regex '(card/pcsc\.rs|main\.rs)$'`.
 
@@ -73,7 +73,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 10 | `ratelimit` | done | `RateLimiter::acquire` -> `UnlockPermit::{success, failure}`, `Denied`, `client_ip`, 26 tests |
 | 11 | `api` (Dropshot) | done | API trait (`api::definition`), handlers (`api::server`), `auth`, `security`, `errors`, OpenAPI snapshot, 55 tests (+7 session/service) |
 | 12 | Real PC/SC card implementation | done | `card::pcsc::PcscCard`, `card::pick_reader`, `main` wiring, `tests/hardware.rs` (feature `hardware-tests`); 8 unit tests + 6 hardware tests |
-| 13 | Frontend | done | `static/{index.html,app.js,app.css}`, 13 JS tests (`node --test static/`), 7 Rust static-file rule tests, repo-wide em dash test |
+| 13 | Frontend | done | `static/{index.html,app.js,app.css}`, 13 JS tests (`node --test "static/*.test.js"`), 7 Rust static-file rule tests, repo-wide em dash test |
 | 14 | Dockerfile (compose dropped) | done | `Dockerfile`, `.dockerignore`, 4 rule tests (`tests/container.rs`); `docker-compose.yml` removed at the user's request |
 | 15 | CI with coverage gate | done (**GitHub Actions**, not GitLab) | `.github/workflows/ci.yml`, `ci/coverage_gate.py` + 7 tests; actionlint clean; not yet run on GitHub |
 | 16 | README | done | `README.md`; `readme_documents_every_config_variable` keeps the config table in sync |
@@ -196,3 +196,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Step 16 done. All 16 build steps complete. 275 Rust tests, 13 JS tests, 7 gate tests, 9 hardware tests (opt-in) green.
 - 2026-10-06: User confirmed manual checklist item 5 (unplug and replug) works. All six section 14.4 items are now done or explained (touch-required is not supported by the NEO).
 - 2026-10-06: Rewrote local history (never pushed) with `git filter-repo --refs main --path ci/__pycache__ --invert-paths` to drop the committed bytecode from every commit, and reworded the commit that described the mistake. Verified: 47 commits before and after, no other file changed in any commit, final tree identical. All commit SHAs changed. The backup branch `backup/pre-history-cleanup` was deleted at the user's request; `main` is the only ref.
+- 2026-10-06: CI `frontend` job failed on Node 24: `node --test static/` treats a directory argument as a module to run, not a folder to search. Now `node --test "static/*.test.js"` (quoted, so Node expands the glob).

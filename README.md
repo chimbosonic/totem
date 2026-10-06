@@ -216,8 +216,8 @@ These are the same commands CI runs (`.github/workflows/ci.yml`):
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
-node --test static/                    # frontend helpers, no npm needed
-python3 -m unittest discover -s ci     # the coverage gate's own tests
+node --test "static/*.test.js"         # frontend helpers, no npm needed
+python3 -m unittest discover -s ci      # the coverage gate's own tests
 ```
 
 Coverage (needs `cargo install cargo-llvm-cov` and the `llvm-tools-preview`
