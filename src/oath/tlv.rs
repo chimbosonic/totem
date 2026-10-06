@@ -27,21 +27,61 @@ pub enum TlvError {
 ///
 /// If `value` is longer than 65535 bytes. YKOATH values are at most a few
 /// dozen bytes, so this is a programming error.
-pub fn encode(_out: &mut Vec<u8>, _tag: u8, _value: &[u8]) {}
+pub fn encode(out: &mut Vec<u8>, tag: u8, value: &[u8]) {
+    let len = value.len();
+    out.push(tag);
+    match len {
+        0..=0x7F => out.push(len as u8),
+        0x80..=0xFF => out.extend_from_slice(&[0x81, len as u8]),
+        0x100..=0xFFFF => {
+            out.push(0x82);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        _ => panic!("TLV value too long: {len} bytes"),
+    }
+    out.extend_from_slice(value);
+}
 
 /// Parse one TLV from the start of `input`, returning it and the remaining bytes.
-pub fn parse(_input: &[u8]) -> Result<(Tlv<'_>, &[u8]), TlvError> {
-    Err(TlvError::Truncated)
+pub fn parse(input: &[u8]) -> Result<(Tlv<'_>, &[u8]), TlvError> {
+    let (&tag, rest) = input.split_first().ok_or(TlvError::Truncated)?;
+    let (&first, rest) = rest.split_first().ok_or(TlvError::Truncated)?;
+    let (len, rest) = match first {
+        0x00..=0x7F => (usize::from(first), rest),
+        0x81 => {
+            let (&b, rest) = rest.split_first().ok_or(TlvError::Truncated)?;
+            (usize::from(b), rest)
+        }
+        0x82 => {
+            let (bytes, rest) = rest.split_first_chunk::<2>().ok_or(TlvError::Truncated)?;
+            (usize::from(u16::from_be_bytes(*bytes)), rest)
+        }
+        other => return Err(TlvError::BadLength(other)),
+    };
+    if rest.len() < len {
+        return Err(TlvError::Truncated);
+    }
+    let (value, rest) = rest.split_at(len);
+    Ok((Tlv { tag, value }, rest))
 }
 
 /// Parse exactly one TLV. Any bytes after it are an error.
-pub fn parse_exact(_input: &[u8]) -> Result<Tlv<'_>, TlvError> {
-    Err(TlvError::Truncated)
+pub fn parse_exact(input: &[u8]) -> Result<Tlv<'_>, TlvError> {
+    match parse(input)? {
+        (tlv, []) => Ok(tlv),
+        (_, rest) => Err(TlvError::TrailingBytes(rest.len())),
+    }
 }
 
 /// Parse a sequence of TLVs that must cover `input` exactly.
-pub fn parse_all(_input: &[u8]) -> Result<Vec<Tlv<'_>>, TlvError> {
-    Err(TlvError::Truncated)
+pub fn parse_all(mut input: &[u8]) -> Result<Vec<Tlv<'_>>, TlvError> {
+    let mut out = Vec::new();
+    while !input.is_empty() {
+        let (tlv, rest) = parse(input)?;
+        out.push(tlv);
+        input = rest;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
