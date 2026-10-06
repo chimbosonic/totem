@@ -41,7 +41,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 6 | `oath::proto` | done | APDU builders, `parse_select`, `verify_validate_response`, `parse_calculate_all`, `parse_calculate`, `transmit_chained`, `status_error`, `parse_name`, 39 tests |
 | 7 | `OathCard` trait and mock card | done | `OathCard`, `CardTransaction`, `CardError`, `card::send`, `card::mock::MockCard`, 29 tests (proto driven end to end against the mock) |
 | 8 | `service` | done | `Service::{startup_check, unlock, codes}`, retry/reconnect, serialisation, 19 tests (+1 mock test) |
-| 9 | `session` | todo | |
+| 9 | `session` | done | `SessionStore::{create, touch, remove, purge}`, `SessionId` (hex cookie, redacted Debug, `log_id`), `spawn_purger`, 17 tests |
 | 10 | `ratelimit` | todo | |
 | 11 | `api` (Dropshot) | todo | |
 | 12 | Real PC/SC card implementation | todo | |
@@ -101,6 +101,9 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: The password is dropped (and zeroized) when the `unlock` card closure is dropped, right after the operation. It cannot be derived before touching the card, because the PBKDF2 salt is the device ID from SELECT.
 - 2026-10-06: `Service::codes` reads the clock once per request; `generated_at`, timesteps, and validity windows all use that one value. Credentials whose name has no valid period prefix use 30s.
 - 2026-10-06: Mock gained `with_forged_validate_response()` to test the card proof failure path.
+- 2026-10-06: Sessions: the store is keyed by SHA-256 of the session ID, not the raw ID, so a memory dump or debug print never shows a usable cookie. `log_id()` is the first 8 bytes of that digest in hex; `SessionId`'s `Debug` prints only that. Cookie value is 64 lowercase hex chars; parsing accepts upper case and rejects anything that is not exactly 64 hex digits.
+- 2026-10-06: Expiry: a session is expired when `now >= last_seen + idle` or `now >= created + max`. `touch()` refreshes `last_seen`, returns a `Zeroizing` copy of the key, and removes the entry if it had expired. Uses `std::sync::Mutex` (no awaits while held).
+- 2026-10-06: `spawn_purger` is tested with `#[tokio::test(start_paused = true)]`; the `tokio::time::sleep` there is virtual time, not real sleeping. Added tokio `time` (and `test-util` for dev).
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
@@ -109,3 +112,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Step 6 done. 102 tests green, fmt and clippy clean. `oath/proto.rs` 99.6% line coverage; crate total 98.6%.
 - 2026-10-06: Step 7 done. 131 tests green, fmt and clippy clean. `card.rs` 100%, `card/mock.rs` 99% line coverage; crate total 98.8%. Caught and fixed two bad tests before going green (a clone sharing state, a chunk size larger than the response).
 - 2026-10-06: Step 8 done. 150 tests green, fmt and clippy clean. `service.rs` 99% line coverage; crate total 98.9%. Found a bug before committing (a protocol error on the retry was reported as `Unavailable`); reproduced it with `wrong_password_on_retry_is_still_wrong_password` first, then fixed it.
+- 2026-10-06: Step 9 done. 167 tests green, fmt and clippy clean. `session.rs` 100% line coverage; crate total 99%. Found that `u8::from_str_radix` accepts a leading `+`, so `+a+a...` parsed as a session cookie; reproduced with a test, then fixed.

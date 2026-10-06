@@ -8,6 +8,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 use crate::clock::Clock;
 use crate::oath::crypto::DerivedKey;
 use crate::rng::{ChallengeSource, SESSION_ID_LEN};
@@ -19,23 +21,40 @@ pub struct SessionId([u8; SESSION_ID_LEN]);
 impl SessionId {
     /// Lowercase hex for the cookie value.
     pub fn to_cookie_value(&self) -> String {
-        todo!()
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Parse a cookie value. `None` unless it is exactly 64 hex digits.
-    pub fn from_cookie_value(_value: &str) -> Option<Self> {
-        todo!()
+    pub fn from_cookie_value(value: &str) -> Option<Self> {
+        // from_str_radix alone would also accept a leading '+'.
+        if value.len() != SESSION_ID_LEN * 2 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut id = [0; SESSION_ID_LEN];
+        for (byte, pair) in id.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let pair = std::str::from_utf8(pair).ok()?;
+            *byte = u8::from_str_radix(pair, 16).ok()?;
+        }
+        Some(Self(id))
     }
 
     /// Short, stable, non-reversible identifier for logs.
     pub fn log_id(&self) -> String {
-        todo!()
+        self.digest()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// SHA-256 of the ID. The store is keyed by this, not the raw ID.
+    fn digest(&self) -> [u8; 32] {
+        Sha256::digest(self.0).into()
     }
 }
 
 impl fmt::Debug for SessionId {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SessionId({})", self.log_id())
     }
 }
 
@@ -70,53 +89,76 @@ impl SessionStore {
     }
 
     /// Store `key` under a new random session ID.
-    pub fn create(&self, _key: DerivedKey) -> SessionId {
-        let _ = (
-            &self.entries,
-            &self.clock,
-            &self.rng,
-            self.idle_secs,
-            self.max_secs,
+    pub fn create(&self, key: DerivedKey) -> SessionId {
+        let id = SessionId(self.rng.session_id());
+        let now = self.clock.now();
+        self.lock().insert(
+            id.digest(),
+            Entry {
+                key,
+                created: now,
+                last_seen: now,
+            },
         );
-        todo!()
+        id
     }
 
     /// Return the session's key and refresh its idle timeout, or `None` if
     /// the session is unknown or expired. Expired sessions are removed.
-    pub fn touch(&self, _id: &SessionId) -> Option<DerivedKey> {
-        todo!()
+    pub fn touch(&self, id: &SessionId) -> Option<DerivedKey> {
+        let now = self.clock.now();
+        let digest = id.digest();
+        let mut entries = self.lock();
+        let entry = entries.get_mut(&digest)?;
+        if self.expired(entry, now) {
+            entries.remove(&digest);
+            return None;
+        }
+        entry.last_seen = now;
+        Some(entry.key.clone())
     }
 
     /// Delete a session. Returns whether it existed.
-    pub fn remove(&self, _id: &SessionId) -> bool {
-        todo!()
+    pub fn remove(&self, id: &SessionId) -> bool {
+        self.lock().remove(&id.digest()).is_some()
     }
 
     /// Delete every expired session. Returns how many were removed.
     pub fn purge(&self) -> usize {
-        todo!()
+        let now = self.clock.now();
+        let mut entries = self.lock();
+        let before = entries.len();
+        entries.retain(|_, entry| !self.expired(entry, now));
+        before - entries.len()
     }
 
     pub fn len(&self) -> usize {
-        todo!()
+        self.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    fn expired(&self, entry: &Entry, now: u64) -> bool {
+        now >= entry.last_seen.saturating_add(self.idle_secs)
+            || now >= entry.created.saturating_add(self.max_secs)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Entry>> {
+        self.entries.lock().expect("session store mutex poisoned")
+    }
 }
 
 /// Run [`SessionStore::purge`] every `every` until the task is aborted.
-pub fn spawn_purger(_store: Arc<SessionStore>, _every: Duration) -> tokio::task::JoinHandle<()> {
-    let _ = Entry::created_unused;
-    todo!()
-}
-
-impl Entry {
-    #[allow(dead_code)]
-    fn created_unused(&self) -> (&DerivedKey, u64, u64) {
-        (&self.key, self.created, self.last_seen)
-    }
+pub fn spawn_purger(store: Arc<SessionStore>, every: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(every);
+        loop {
+            ticks.tick().await;
+            store.purge();
+        }
+    })
 }
 
 #[cfg(test)]
@@ -287,6 +329,7 @@ mod tests {
             &"0".repeat(65),
             &"zz".repeat(32),
             &"é".repeat(32),
+            &"+a".repeat(32),
         ] {
             assert_eq!(SessionId::from_cookie_value(value), None, "{value:?}");
         }
