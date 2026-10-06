@@ -24,7 +24,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 ## Hardware available for integration tests
 
 - YubiKey NEO 3.4.9 (serial 4551023), interfaces OTP+FIDO+CCID, OATH applet version 1.0.0.
-- One credential: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user says it uses the RFC 6238 test setup.
+- One credential: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user confirmed it uses the RFC 6238 SHA-256 test secret `12345678901234567890123456789012` (ASCII, 32 bytes), so expected codes can be checked against the RFC 6238 Appendix B vectors as well as `ykman oath accounts code`.
 - OATH password protection is **disabled** (checked 2026-10-06 with `ykman oath info`). The service refuses to start against an unprotected applet (section 7), so a password must be set (`ykman oath access change`) before a full end-to-end run. Ask the user before changing anything on the key.
 - Hardware integration tests must not run in normal `cargo test` (section 14.1: no hardware in tests). Plan: put them in `tests/` behind an opt-in (a Cargo feature or env var), and compare with `ykman oath accounts code`.
 - The NEO's older applet may not support SHA512 credentials; do not assume it does in hardware tests.
