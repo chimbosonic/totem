@@ -1,0 +1,13 @@
+[package]
+name = "oath-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+slog = "2.8.2"
+slog-async = "2.8.0"
+slog-json = "2.6.1"
+
+[dev-dependencies]
+serde_json = "1.0.151"
