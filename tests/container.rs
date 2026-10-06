@@ -1,6 +1,6 @@
-//! Rules for the container files from PLAN.md section 13. YAML and
-//! Dockerfile syntax are checked by building the image; these tests guard
-//! the security properties that are easy to lose in an edit.
+//! Rules for the container image from PLAN.md section 13. Dockerfile syntax
+//! is checked by building the image; these tests guard the security
+//! properties that are easy to lose in an edit.
 
 use std::fs;
 use std::path::Path;
@@ -91,65 +91,6 @@ fn dockerignore_keeps_secrets_and_build_output_out_of_the_context() {
                 .iter()
                 .any(|e| e.trim_start_matches('/') == required),
             ".dockerignore must list {required}"
-        );
-    }
-}
-
-#[test]
-fn compose_hardens_the_container() {
-    let compose = read("docker-compose.yml");
-    for required in [
-        "read_only: true",
-        "cap_drop: [ALL]",
-        "no-new-privileges:true",
-        "/run/pcscd:/run/pcscd",
-        "restart: unless-stopped",
-        "external: true",
-    ] {
-        assert!(
-            compose.contains(required),
-            "docker-compose.yml lacks {required}"
-        );
-    }
-}
-
-#[test]
-fn compose_publishes_no_host_port() {
-    let compose = read("docker-compose.yml");
-    assert!(
-        !compose
-            .lines()
-            .any(|l| l.trim_start().starts_with("ports:")),
-        "only Traefik may reach the service"
-    );
-}
-
-#[test]
-fn traefik_headers_middleware_matches_the_app() {
-    let compose = read("docker-compose.yml");
-    assert!(
-        compose.contains("traefik.http.routers.oath.middlewares: oath-lan,oath-headers"),
-        "router must use both middlewares"
-    );
-    let csp = format!(
-        "traefik.http.middlewares.oath-headers.headers.contentSecurityPolicy: \"{}\"",
-        oath_web::api::security::CSP
-    );
-    assert!(
-        compose.contains(&csp),
-        "CSP in compose must equal the app's"
-    );
-    for required in [
-        "traefik.http.middlewares.oath-headers.headers.contentTypeNosniff: \"true\"",
-        "traefik.http.middlewares.oath-headers.headers.frameDeny: \"true\"",
-        "traefik.http.middlewares.oath-headers.headers.referrerPolicy: \"no-referrer\"",
-        "traefik.http.middlewares.oath-headers.headers.customResponseHeaders.Cache-Control: \"no-store\"",
-        "traefik.http.middlewares.oath-lan.ipallowlist.sourcerange:",
-        "traefik.http.services.oath.loadbalancer.server.port: \"8080\"",
-    ] {
-        assert!(
-            compose.contains(required),
-            "docker-compose.yml lacks {required}"
         );
     }
 }

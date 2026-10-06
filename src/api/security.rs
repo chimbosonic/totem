@@ -6,7 +6,7 @@
 //!
 //! Responses Dropshot generates before a handler returns (unknown routes,
 //! `TypedBody` parse and size errors) do not pass through here. They carry
-//! no secrets; the Traefik headers middleware is the backstop for them.
+//! no secrets. A reverse proxy can add the same headers to them if wanted.
 
 use dropshot::{Body, HttpCodedResponse, HttpError, HttpResponseHeaders};
 use http::header::{
