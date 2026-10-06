@@ -38,7 +38,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 3 | `config` | done | `Config::from_lookup` (tested) and `from_env` (thin wrapper), 15 tests; `main` uses it |
 | 4 | `oath::tlv` | done | `encode`, `parse` (lenient, returns rest), `parse_exact` (strict), `parse_all` (strict sequence), 18 tests |
 | 5 | `oath::crypto` | done | `derive_key`, `hmac`, `dynamic_truncate`, `format_code`, `timestep`, `validity_window`, `constant_time_eq`, `Algorithm`, 17 tests |
-| 6 | `oath::proto` | todo | |
+| 6 | `oath::proto` | done | APDU builders, `parse_select`, `verify_validate_response`, `parse_calculate_all`, `parse_calculate`, `transmit_chained`, `status_error`, `parse_name`, 39 tests |
 | 7 | `OathCard` trait and mock card | todo | |
 | 8 | `service` | todo | |
 | 9 | `session` | todo | |
@@ -52,7 +52,8 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 
 ## Open questions and things to verify
 
-- YKOATH bytes in section 5 must be checked against the Yubico spec before relying on them.
+- YKOATH bytes in section 5 were written from the Yubico spec as recalled, not fetched. Confirm on hardware in step 12: SELECT/CALCULATE ALL round trip on the NEO, and that APDUs without Le are accepted (ykman style).
+- Which status word does the NEO return for a wrong VALIDATE? Spec says `6984` (mapped to `WrongPassword`). `6A80` currently maps to a generic `Status` error. Needs a password set on the key to check.
 - Dropshot: which response types allow custom headers (cookies, `Retry-After`)?
 - Dropshot: can `HttpError` carry `Retry-After` for 429?
 - Dropshot: behaviour of `TypedBody` on non-JSON `Content-Type`.
@@ -84,8 +85,15 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: `timestep` and `validity_window` take `NonZeroU32` periods so a zero period cannot reach a division. Name parsing in `proto` must reject `0/...`.
 - 2026-10-06: The `/api/codes` example in PLAN.md section 9 has `valid_from` 1759751990, which is not a multiple of 30. Real windows are period-aligned; treat the example as illustrative only.
 - 2026-10-06: `Algorithm::from_ykoath` uses only the low nibble, so it accepts both a bare algorithm byte (SELECT `0x7B`) and a type|algorithm byte.
+- 2026-10-06: `proto` is pure. Chaining is `transmit_chained(transmit_closure, apdu)`, generic over the caller's error type `E: From<ProtoError>`, so the card layer passes its own transport errors straight through. Chains are capped at 64 SEND REMAINING rounds.
+- 2026-10-06: Status words are mapped per command: `6984` is `WrongPassword` on VALIDATE and `NotFound` elsewhere; `6982` is `AuthRequired`; anything else is `Status(sw)`.
+- 2026-10-06: APDUs are short-form with no Le byte, matching ykman. Lc over 255 panics (names are at most 64 bytes, so it is a programming error).
+- 2026-10-06: `parse_select` ignores unknown tags (newer firmware adds some) but requires version and name, and a known algorithm whenever a challenge is present. A card HMAC mismatch in VALIDATE is `CardAuthFailed`.
+- 2026-10-06: CALCULATE ALL entries keep the raw name bytes; name parsing is separate (`parse_name`) so the service can re-send the exact name in CALCULATE. A full `0x75` response (non-truncated) is treated as malformed since we always ask for truncated.
+- 2026-10-06: `parse_name` is infallible. A prefix that is not a positive whole number (`0/`, `/`, overflow, `+5/`) stays in the issuer rather than failing the whole response. Invalid UTF-8 is shown lossily. The period prefix is parsed for every credential type; ykman only does so for TOTP, which only affects how an HOTP named like `60/x` is displayed.
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
 - 2026-10-06: Step 4 done. 46 tests green, fmt and clippy clean. `oath/tlv.rs` 100% line coverage; crate total 97%.
 - 2026-10-06: Step 5 done. 63 tests green, fmt and clippy clean. `oath/crypto.rs` 100% line coverage; crate total 98%. One test had wrong data copied from the PLAN.md example (see decisions); fixed the test, not the code.
+- 2026-10-06: Step 6 done. 102 tests green, fmt and clippy clean. `oath/proto.rs` 99.6% line coverage; crate total 98.6%.

@@ -63,8 +63,13 @@ pub enum ProtoError {
 }
 
 /// Map a non-success status word to a typed error.
-pub fn status_error(_command: Command, _sw: u16) -> ProtoError {
-    todo!()
+pub fn status_error(command: Command, sw: u16) -> ProtoError {
+    match (command, sw) {
+        (Command::Validate, SW_NO_SUCH_OBJECT) => ProtoError::WrongPassword,
+        (_, SW_NO_SUCH_OBJECT) => ProtoError::NotFound,
+        (_, SW_AUTH_REQUIRED) => ProtoError::AuthRequired,
+        (_, other) => ProtoError::Status(other),
+    }
 }
 
 /// Response data with its final status word.
@@ -76,57 +81,95 @@ pub struct Response {
 
 impl Response {
     /// Split a raw card response into data and the trailing status word.
-    pub fn parse(_raw: &[u8]) -> Result<Self, ProtoError> {
-        todo!()
+    pub fn parse(raw: &[u8]) -> Result<Self, ProtoError> {
+        let (data, sw) = raw
+            .split_last_chunk::<2>()
+            .ok_or(ProtoError::Malformed("response shorter than a status word"))?;
+        Ok(Self {
+            data: data.to_vec(),
+            sw: u16::from_be_bytes(*sw),
+        })
     }
 
     /// The data if the status is `9000`, otherwise the typed error.
-    pub fn into_data(self, _command: Command) -> Result<Vec<u8>, ProtoError> {
-        todo!()
+    pub fn into_data(self, command: Command) -> Result<Vec<u8>, ProtoError> {
+        match self.sw {
+            SW_OK => Ok(self.data),
+            sw => Err(status_error(command, sw)),
+        }
     }
 }
 
 /// Send `apdu`, then keep sending SEND REMAINING while the card answers
 /// `61xx`, concatenating the data. Returns the data and the final status word.
 pub fn transmit_chained<E: From<ProtoError>>(
-    _transmit: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
-    _apdu: &[u8],
+    mut transmit: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
+    apdu: &[u8],
 ) -> Result<Response, E> {
-    let _ = (MAX_CHAIN, SW_OK, SW_AUTH_REQUIRED, SW_NO_SUCH_OBJECT);
-    todo!()
+    let mut response = Response::parse(&transmit(apdu)?)?;
+    let mut rounds = 0;
+    while response.sw >> 8 == 0x61 {
+        rounds += 1;
+        if rounds > MAX_CHAIN {
+            return Err(ProtoError::Malformed("too many SEND REMAINING rounds").into());
+        }
+        let next = Response::parse(&transmit(&send_remaining_apdu())?)?;
+        response.data.extend(next.data);
+        response.sw = next.sw;
+    }
+    Ok(response)
+}
+
+/// Short APDU with optional data and no Le, as ykman sends them.
+fn apdu(ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
+    let lc = u8::try_from(data.len()).expect("APDU data longer than 255 bytes");
+    let mut out = vec![0x00, ins, p1, p2];
+    if lc > 0 {
+        out.push(lc);
+        out.extend_from_slice(data);
+    }
+    out
 }
 
 pub fn select_apdu() -> Vec<u8> {
-    todo!()
+    apdu(INS_SELECT, 0x04, 0x00, &AID)
 }
 
 pub fn send_remaining_apdu() -> Vec<u8> {
-    let _ = INS_SEND_REMAINING;
-    todo!()
+    apdu(INS_SEND_REMAINING, 0x00, 0x00, &[])
 }
 
 /// VALIDATE: prove we hold `key` by answering `card_challenge`, and send
 /// `our_challenge` for the card to answer.
 pub fn validate_apdu(
-    _algorithm: Algorithm,
-    _key: &[u8],
-    _card_challenge: &[u8],
-    _our_challenge: &[u8],
+    algorithm: Algorithm,
+    key: &[u8],
+    card_challenge: &[u8],
+    our_challenge: &[u8],
 ) -> Vec<u8> {
-    let _ = (INS_VALIDATE, TAG_RESPONSE);
-    todo!()
+    let mut data = Vec::new();
+    tlv::encode(
+        &mut data,
+        TAG_RESPONSE,
+        &crypto::hmac(algorithm, key, card_challenge),
+    );
+    tlv::encode(&mut data, TAG_CHALLENGE, our_challenge);
+    apdu(INS_VALIDATE, 0x00, 0x00, &data)
 }
 
 /// CALCULATE ALL with truncated responses for `timestep`.
-pub fn calculate_all_apdu(_timestep: u64) -> Vec<u8> {
-    let _ = (INS_CALCULATE_ALL, TAG_CHALLENGE);
-    todo!()
+pub fn calculate_all_apdu(timestep: u64) -> Vec<u8> {
+    let mut data = Vec::new();
+    tlv::encode(&mut data, TAG_CHALLENGE, &timestep.to_be_bytes());
+    apdu(INS_CALCULATE_ALL, 0x00, 0x01, &data)
 }
 
 /// CALCULATE with a truncated response for one credential.
-pub fn calculate_apdu(_name: &[u8], _timestep: u64) -> Vec<u8> {
-    let _ = (INS_CALCULATE, INS_SELECT);
-    todo!()
+pub fn calculate_apdu(name: &[u8], timestep: u64) -> Vec<u8> {
+    let mut data = Vec::new();
+    tlv::encode(&mut data, TAG_NAME, name);
+    tlv::encode(&mut data, TAG_CHALLENGE, &timestep.to_be_bytes());
+    apdu(INS_CALCULATE, 0x00, 0x01, &data)
 }
 
 /// Challenge and algorithm the card sends when a password is set.
@@ -145,20 +188,57 @@ pub struct SelectResponse {
     pub auth: Option<AuthChallenge>,
 }
 
-pub fn parse_select(_data: &[u8]) -> Result<SelectResponse, ProtoError> {
-    let _ = (TAG_VERSION, TAG_ALGORITHM, TAG_NAME);
-    todo!()
+pub fn parse_select(data: &[u8]) -> Result<SelectResponse, ProtoError> {
+    let (mut version, mut device_id, mut challenge, mut algorithm) = (None, None, None, None);
+    for item in tlv::parse_all(data)? {
+        match item.tag {
+            TAG_VERSION => version = Some(item.value.to_vec()),
+            TAG_NAME => device_id = Some(item.value.to_vec()),
+            TAG_CHALLENGE => challenge = Some(item.value.to_vec()),
+            TAG_ALGORITHM => algorithm = Some(item.value),
+            // Newer firmware adds tags we do not need.
+            _ => {}
+        }
+    }
+    let auth = match challenge {
+        None => None,
+        Some(challenge) => {
+            let algorithm = algorithm
+                .and_then(|a| a.first().copied())
+                .and_then(Algorithm::from_ykoath)
+                .ok_or(ProtoError::Malformed(
+                    "SELECT challenge without a known algorithm",
+                ))?;
+            Some(AuthChallenge {
+                challenge,
+                algorithm,
+            })
+        }
+    };
+    Ok(SelectResponse {
+        version: version.ok_or(ProtoError::Malformed("SELECT without version"))?,
+        device_id: device_id.ok_or(ProtoError::Malformed("SELECT without name"))?,
+        auth,
+    })
 }
 
 /// Check the card's VALIDATE answer to `our_challenge`.
 pub fn verify_validate_response(
-    _data: &[u8],
-    _algorithm: Algorithm,
-    _key: &[u8],
-    _our_challenge: &[u8],
+    data: &[u8],
+    algorithm: Algorithm,
+    key: &[u8],
+    our_challenge: &[u8],
 ) -> Result<(), ProtoError> {
-    let _ = crypto::constant_time_eq;
-    todo!()
+    let answer = tlv::parse_all(data)?
+        .into_iter()
+        .find(|item| item.tag == TAG_RESPONSE)
+        .ok_or(ProtoError::Malformed("VALIDATE without response"))?;
+    let expected = crypto::hmac(algorithm, key, our_challenge);
+    if crypto::constant_time_eq(answer.value, &expected) {
+        Ok(())
+    } else {
+        Err(ProtoError::CardAuthFailed)
+    }
 }
 
 /// A truncated code: digit count plus the 4 value bytes.
@@ -188,13 +268,54 @@ pub struct CalculatedEntry {
     pub state: EntryState,
 }
 
-pub fn parse_calculate_all(_data: &[u8]) -> Result<Vec<CalculatedEntry>, ProtoError> {
-    let _ = (TAG_TRUNCATED, TAG_HOTP, TAG_TOUCH, tlv::parse_all);
-    todo!()
+pub fn parse_calculate_all(data: &[u8]) -> Result<Vec<CalculatedEntry>, ProtoError> {
+    let items = tlv::parse_all(data)?;
+    let mut pairs = items.chunks_exact(2);
+    let mut entries = Vec::with_capacity(items.len() / 2);
+    for pair in &mut pairs {
+        let (name, result) = (pair[0], pair[1]);
+        if name.tag != TAG_NAME {
+            return Err(ProtoError::Malformed("CALCULATE ALL entry without name"));
+        }
+        let state = match result.tag {
+            TAG_TRUNCATED => EntryState::Code(parse_truncated(result.value)?),
+            TAG_HOTP => EntryState::Hotp,
+            TAG_TOUCH => EntryState::TouchRequired,
+            _ => {
+                return Err(ProtoError::Malformed(
+                    "CALCULATE ALL entry with unknown result",
+                ));
+            }
+        };
+        entries.push(CalculatedEntry {
+            name: name.value.to_vec(),
+            state,
+        });
+    }
+    if !pairs.remainder().is_empty() {
+        return Err(ProtoError::Malformed("CALCULATE ALL name without result"));
+    }
+    Ok(entries)
 }
 
-pub fn parse_calculate(_data: &[u8]) -> Result<TruncatedCode, ProtoError> {
-    todo!()
+pub fn parse_calculate(data: &[u8]) -> Result<TruncatedCode, ProtoError> {
+    let item = tlv::parse_all(data)?
+        .into_iter()
+        .find(|item| item.tag == TAG_TRUNCATED)
+        .ok_or(ProtoError::Malformed(
+            "CALCULATE without truncated response",
+        ))?;
+    parse_truncated(item.value)
+}
+
+fn parse_truncated(value: &[u8]) -> Result<TruncatedCode, ProtoError> {
+    match *value {
+        [digits, a, b, c, d] => Ok(TruncatedCode {
+            digits,
+            value: [a, b, c, d],
+        }),
+        _ => Err(ProtoError::Malformed("truncated response is not 5 bytes")),
+    }
 }
 
 /// A credential name split into its parts.
@@ -209,8 +330,19 @@ pub struct CredentialName {
 ///
 /// A prefix that is not a positive whole number followed by `/` is left as
 /// part of the name, so a strange name never hides a credential.
-pub fn parse_name(_raw: &[u8]) -> CredentialName {
-    todo!()
+pub fn parse_name(raw: &[u8]) -> CredentialName {
+    let name = String::from_utf8_lossy(raw);
+    let (period, rest) = name
+        .split_once('/')
+        .filter(|(prefix, _)| !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|(prefix, rest)| Some((prefix.parse::<NonZeroU32>().ok()?, rest)))
+        .unwrap_or((DEFAULT_PERIOD, &name));
+    let (issuer, account) = rest.split_once(':').unwrap_or(("", rest));
+    CredentialName {
+        period,
+        issuer: issuer.to_owned(),
+        account: account.to_owned(),
+    }
 }
 
 #[cfg(test)]
