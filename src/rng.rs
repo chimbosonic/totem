@@ -30,7 +30,11 @@ pub trait ChallengeSource: Send + Sync {
 pub struct OsChallengeSource;
 
 impl ChallengeSource for OsChallengeSource {
-    fn fill(&self, _buf: &mut [u8]) {}
+    fn fill(&self, buf: &mut [u8]) {
+        // The OS RNG does not fail on supported platforms once the process is
+        // running. If it ever does, continuing without randomness is unsafe.
+        getrandom::fill(buf).expect("operating system RNG failed");
+    }
 }
 
 /// Test source. Emits the byte sequence `seed, seed+1, seed+2, ...`
@@ -42,14 +46,20 @@ pub struct SequentialChallengeSource {
 }
 
 impl SequentialChallengeSource {
-    pub fn new(_seed: u8) -> Self {
-        Self::default()
+    pub fn new(seed: u8) -> Self {
+        Self {
+            next: Mutex::new(seed),
+        }
     }
 }
 
 impl ChallengeSource for SequentialChallengeSource {
-    fn fill(&self, _buf: &mut [u8]) {
-        let _ = &self.next;
+    fn fill(&self, buf: &mut [u8]) {
+        let mut next = self.next.lock().expect("rng mutex poisoned");
+        for byte in buf {
+            *byte = *next;
+            *next = next.wrapping_add(1);
+        }
     }
 }
 
