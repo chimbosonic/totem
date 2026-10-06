@@ -26,19 +26,19 @@ fn stages(dockerfile: &str) -> Vec<String> {
 }
 
 #[test]
-fn dockerfile_builds_on_rust_bookworm_and_runs_on_slim() {
+fn dockerfile_builds_on_rust_trixie_and_runs_on_slim() {
     let dockerfile = read("Dockerfile");
     let stages = stages(&dockerfile);
     assert_eq!(stages.len(), 2, "builder and runtime stages");
     assert!(
-        stages[0].contains("FROM rust:1-bookworm AS build"),
+        stages[0].contains("FROM rust:1-trixie AS build"),
         "{}",
         stages[0]
     );
     assert!(stages[0].contains("libpcsclite-dev") && stages[0].contains("pkg-config"));
     assert!(stages[0].contains("cargo build --release --locked"));
     assert!(
-        stages[1].starts_with("FROM debian:bookworm-slim"),
+        stages[1].starts_with("FROM debian:trixie-slim"),
         "{}",
         stages[1]
     );

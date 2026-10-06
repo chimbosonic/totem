@@ -89,7 +89,7 @@ startup with a message naming the variable.
 
 ## Container
 
-The image is built from the `Dockerfile` (Debian bookworm slim, runs as uid
+The image is built from the `Dockerfile` (Debian trixie slim, runs as uid
 10001, about 35 MB). CI publishes it to `ghcr.io/<owner>/totem` for pushes
 to `main` and for version tags.
 
@@ -116,10 +116,12 @@ docker run -d --name totem --restart unless-stopped \
   service, over the shared network.
 - The root filesystem can be read-only: the service writes nothing and logs
   JSON to stdout.
-- The pcsc-lite client in the image (1.9.9, Debian bookworm) must speak the
-  same protocol as the host's `pcscd`. If the host is not Debian bookworm and
-  the container cannot connect, change both `FROM` lines in the `Dockerfile` to
-  match the host distro, or use option B.
+- The pcsc-lite client in the image (2.x from Debian trixie, protocol 4:5)
+  must speak the same protocol as the host's `pcscd`. Hosts with pcsc-lite 2.x
+  (Debian trixie, current Ubuntu, Fedora, openSUSE Tumbleweed) match. On a host
+  with pcsc-lite 1.x (Debian bookworm and older), the container cannot connect
+  and the host's `pcscd` logs "Communication protocol mismatch"; change both
+  `FROM` lines in the `Dockerfile` to match the host distro, or use option B.
 - Some hosts (recent Fedora, Ubuntu) build pcsc-lite with polkit, which can
   refuse clients that are not local users, including a container. If the log
   says access was denied, allow the client in polkit or use option B.

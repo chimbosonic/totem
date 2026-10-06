@@ -283,13 +283,13 @@ Never log the password, derived key, raw session ID, or codes.
 
 **Dockerfile** (multi-stage)
 
-- Builder: `rust:1-bookworm`, install `libpcsclite-dev` and `pkg-config`, `cargo build --release --locked`.
-- Runtime: `debian:bookworm-slim`, install `libpcsclite1` and `ca-certificates` only. Run as a non-root user. Read-only root filesystem compatible.
+- Builder: `rust:1-trixie`, install `libpcsclite-dev` and `pkg-config`, `cargo build --release --locked`.
+- Runtime: `debian:trixie-slim`, install `libpcsclite1` and `ca-certificates` only. Run as a non-root user. Read-only root filesystem compatible.
 
 **pcscd: host socket (default)**
 
 - Host runs `pcscd`. Mount `/run/pcscd` into the container read-write.
-- Watch for a pcsc-lite protocol version mismatch between host and container. If the host is not Debian bookworm, match the runtime base image to the host distro or switch to the option below.
+- Watch for a pcsc-lite protocol version mismatch between host and container. If the host's pcsc-lite is not 2.x (protocol 4:5), match the runtime base image to the host distro or switch to the option below.
 
 **pcscd: inside the container (fallback)**
 
