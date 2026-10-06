@@ -18,14 +18,16 @@ pub fn build_logger<W: Write + Send + 'static>(writer: W, level: Level) -> Logge
     Logger::root(drain, o!())
 }
 
+/// In-memory log capture for tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use slog::{debug, info};
+pub(crate) mod test_support {
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
 
+    use slog::{Drain, Logger, o};
+
     #[derive(Clone, Default)]
-    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct SharedBuf(Arc<Mutex<Vec<u8>>>);
 
     impl Write for SharedBuf {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -37,15 +39,33 @@ mod tests {
     }
 
     impl SharedBuf {
-        fn lines(&self) -> Vec<serde_json::Value> {
-            let bytes = self.0.lock().unwrap().clone();
-            String::from_utf8(bytes)
-                .unwrap()
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+
+        pub(crate) fn lines(&self) -> Vec<serde_json::Value> {
+            self.text()
                 .lines()
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect()
         }
+
+        /// A synchronous JSON logger writing to this buffer at every level,
+        /// so tests can read records without waiting for a background thread.
+        pub(crate) fn logger(&self) -> Logger {
+            let json = slog_json::Json::new(self.clone())
+                .add_default_keys()
+                .build();
+            Logger::root(Mutex::new(json).fuse(), o!())
+        }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::SharedBuf;
+    use super::*;
+    use slog::{debug, info};
 
     #[test]
     fn logger_writes_json_lines_with_message_and_fields() {

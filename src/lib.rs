@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod api;
 pub mod card;
 pub mod clock;
 pub mod config;
