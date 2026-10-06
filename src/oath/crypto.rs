@@ -2,6 +2,10 @@
 
 use std::num::NonZeroU32;
 
+use hmac::{Hmac, KeyInit, Mac};
+use sha1::Sha1;
+use sha2::{Sha256, Sha512};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 /// Length of the key derived from the OATH password.
@@ -22,20 +26,37 @@ pub enum Algorithm {
 impl Algorithm {
     /// Map a YKOATH algorithm byte. Only the low nibble carries the
     /// algorithm; the high nibble is the credential type (HOTP or TOTP).
-    pub fn from_ykoath(_byte: u8) -> Option<Self> {
-        None
+    pub fn from_ykoath(byte: u8) -> Option<Self> {
+        match byte & 0x0F {
+            0x01 => Some(Self::Sha1),
+            0x02 => Some(Self::Sha256),
+            0x03 => Some(Self::Sha512),
+            _ => None,
+        }
     }
 }
 
 /// `PBKDF2-HMAC-SHA1(password, salt, 1000 rounds, 16 bytes)`. The salt is the
 /// device ID from the SELECT response.
-pub fn derive_key(_password: &str, _salt: &[u8]) -> DerivedKey {
-    Zeroizing::new([0; KEY_LEN])
+pub fn derive_key(password: &str, salt: &[u8]) -> DerivedKey {
+    let mut key = Zeroizing::new([0; KEY_LEN]);
+    pbkdf2::pbkdf2_hmac::<Sha1>(password.as_bytes(), salt, PBKDF2_ROUNDS, key.as_mut());
+    key
 }
 
 /// HMAC of `message` under `key` with `algorithm`.
-pub fn hmac(_algorithm: Algorithm, _key: &[u8], _message: &[u8]) -> Vec<u8> {
-    Vec::new()
+pub fn hmac(algorithm: Algorithm, key: &[u8], message: &[u8]) -> Vec<u8> {
+    fn run<M: Mac + KeyInit>(key: &[u8], message: &[u8]) -> Vec<u8> {
+        // HMAC accepts keys of any length, so this cannot fail.
+        let mut mac = <M as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(message);
+        mac.finalize().into_bytes().to_vec()
+    }
+    match algorithm {
+        Algorithm::Sha1 => run::<Hmac<Sha1>>(key, message),
+        Algorithm::Sha256 => run::<Hmac<Sha256>>(key, message),
+        Algorithm::Sha512 => run::<Hmac<Sha512>>(key, message),
+    }
 }
 
 /// RFC 4226 section 5.3 dynamic truncation: pick 4 bytes of `mac` at the
@@ -44,29 +65,42 @@ pub fn hmac(_algorithm: Algorithm, _key: &[u8], _message: &[u8]) -> Vec<u8> {
 /// # Panics
 ///
 /// If `mac` is shorter than 20 bytes. Every supported HMAC output is longer.
-pub fn dynamic_truncate(_mac: &[u8]) -> [u8; 4] {
-    [0; 4]
+pub fn dynamic_truncate(mac: &[u8]) -> [u8; 4] {
+    assert!(
+        mac.len() >= 20,
+        "HMAC output too short: {} bytes",
+        mac.len()
+    );
+    let offset = usize::from(mac[mac.len() - 1] & 0x0F);
+    let mut out = [0; 4];
+    out.copy_from_slice(&mac[offset..offset + 4]);
+    out
 }
 
 /// Turn a truncated value into a zero-padded code of `digits` digits.
 /// The top bit is masked off as RFC 4226 requires.
-pub fn format_code(_digits: u8, _value: [u8; 4]) -> String {
-    String::new()
+pub fn format_code(digits: u8, value: [u8; 4]) -> String {
+    let n = u64::from(u32::from_be_bytes(value) & 0x7FFF_FFFF);
+    let n = 10u64.checked_pow(u32::from(digits)).map_or(n, |m| n % m);
+    format!("{n:0width$}", width = usize::from(digits))
 }
 
 /// TOTP timestep: `floor(unix_time / period)`.
-pub fn timestep(_unix_time: u64, _period: NonZeroU32) -> u64 {
-    0
+pub fn timestep(unix_time: u64, period: NonZeroU32) -> u64 {
+    unix_time / u64::from(period.get())
 }
 
 /// Start (inclusive) and end (exclusive) of the period containing `unix_time`.
-pub fn validity_window(_unix_time: u64, _period: NonZeroU32) -> (u64, u64) {
-    (0, 0)
+pub fn validity_window(unix_time: u64, period: NonZeroU32) -> (u64, u64) {
+    let len = u64::from(period.get());
+    let start = timestep(unix_time, period) * len;
+    (start, start + len)
 }
 
 /// Compare in constant time for equal lengths. Different lengths are unequal.
-pub fn constant_time_eq(_a: &[u8], _b: &[u8]) -> bool {
-    false
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // subtle returns false for different lengths without comparing contents.
+    a.ct_eq(b).into()
 }
 
 #[cfg(test)]
@@ -240,7 +274,7 @@ mod tests {
         assert_eq!(validity_window(59, period(60)), (0, 60));
         assert_eq!(
             validity_window(1759752005, period(30)),
-            (1759751990, 1759752020)
+            (1759752000, 1759752030)
         );
     }
 

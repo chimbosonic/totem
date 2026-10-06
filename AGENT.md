@@ -24,7 +24,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 ## Hardware available for integration tests
 
 - YubiKey NEO 3.4.9 (serial 4551023), interfaces OTP+FIDO+CCID, OATH applet version 1.0.0.
-- One credential: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user confirmed it uses the RFC 6238 SHA-256 test secret `12345678901234567890123456789012` (ASCII, 32 bytes), so expected codes can be checked against the RFC 6238 Appendix B vectors as well as `ykman oath accounts code`.
+- One credential: `RFC6238:sha256` (issuer `RFC6238`, account `sha256`). The user confirmed it uses the RFC 6238 SHA-256 test secret `12345678901234567890123456789012` (ASCII, 32 bytes), so expected codes can be checked against the RFC 6238 Appendix B vectors as well as `ykman oath accounts code`. Verified 2026-10-06: SHA-256, **8 digits**, 30s period; `ykman` code matched an independent Python computation.
 - OATH password protection is **disabled** (checked 2026-10-06 with `ykman oath info`). The service refuses to start against an unprotected applet (section 7), so a password must be set (`ykman oath access change`) before a full end-to-end run. Ask the user before changing anything on the key.
 - Hardware integration tests must not run in normal `cargo test` (section 14.1: no hardware in tests). Plan: put them in `tests/` behind an opt-in (a Cargo feature or env var), and compare with `ykman oath accounts code`.
 - The NEO's older applet may not support SHA512 credentials; do not assume it does in hardware tests.
@@ -37,7 +37,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 2 | `clock` and `rng` traits | done | `Clock` (`SystemClock`, `ManualClock`), `ChallengeSource` (`OsChallengeSource`, `SequentialChallengeSource`), 11 tests |
 | 3 | `config` | done | `Config::from_lookup` (tested) and `from_env` (thin wrapper), 15 tests; `main` uses it |
 | 4 | `oath::tlv` | done | `encode`, `parse` (lenient, returns rest), `parse_exact` (strict), `parse_all` (strict sequence), 18 tests |
-| 5 | `oath::crypto` | todo | |
+| 5 | `oath::crypto` | done | `derive_key`, `hmac`, `dynamic_truncate`, `format_code`, `timestep`, `validity_window`, `constant_time_eq`, `Algorithm`, 17 tests |
 | 6 | `oath::proto` | todo | |
 | 7 | `OathCard` trait and mock card | todo | |
 | 8 | `service` | todo | |
@@ -78,7 +78,14 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: Config leniency: values are trimmed; empty `OATH_READER` means unset; `OATH_TRUSTED_PROXIES` accepts bare IPs as /32 or /128 and skips empty entries; `OATH_LOG_LEVEL` is case-insensitive and also accepts `warn`. TTLs and the fail limit must be at least 1; idle equal to max is allowed.
 - 2026-10-06: Added `thiserror` 2 and `ipnet` 2 (CIDR parsing).
 - 2026-10-06: TLV: `encode` is infallible and panics above 65535 bytes (YKOATH values are tiny, so that is a programming error). Parsing accepts non-minimal long lengths (`0x81 0x02`) and rejects length bytes `0x80` and `0x83..=0xFF`. "Strict" means `parse_exact` / `parse_all`; `parse` is the lenient form that returns trailing bytes.
+- 2026-10-06: Crypto deps: RustCrypto `pbkdf2` 0.13, `hmac` 0.13, `sha1`/`sha2` 0.11 (one digest 0.11 family, no duplicates), `subtle` 2.6, `zeroize` 1.9; dev `hex-literal` 1.1.
+- 2026-10-06: All crypto test vectors were checked with Python stdlib before use. PBKDF2 at 1000 rounds / 16 bytes has no published vector, so the expected values come from `hashlib.pbkdf2_hmac`. The real-key PBKDF2 fixture (section 14.4) is still pending: the key has no password yet.
+- 2026-10-06: `format_code` masks the top bit (`& 0x7FFFFFFF`) per RFC 4226, which PLAN.md section 5 omits. Harmless for card output and matches ykman.
+- 2026-10-06: `timestep` and `validity_window` take `NonZeroU32` periods so a zero period cannot reach a division. Name parsing in `proto` must reject `0/...`.
+- 2026-10-06: The `/api/codes` example in PLAN.md section 9 has `valid_from` 1759751990, which is not a multiple of 30. Real windows are period-aligned; treat the example as illustrative only.
+- 2026-10-06: `Algorithm::from_ykoath` uses only the low nibble, so it accepts both a bare algorithm byte (SELECT `0x7B`) and a type|algorithm byte.
 - 2026-10-06: User reported a YubiKey with an RFC 6238 credential is plugged in. Checked it read-only with `ykman`; details under "Hardware available".
 - 2026-10-06: Step 2 done. 13 tests green, fmt and clippy clean. `clock.rs` and `rng.rs` at 100% line coverage; crate total 96%.
 - 2026-10-06: Step 3 done. 28 tests green, fmt and clippy clean. `config.rs` 97% line coverage; crate total 96%. `main` exits 1 with a clear message on invalid config.
 - 2026-10-06: Step 4 done. 46 tests green, fmt and clippy clean. `oath/tlv.rs` 100% line coverage; crate total 97%.
+- 2026-10-06: Step 5 done. 63 tests green, fmt and clippy clean. `oath/crypto.rs` 100% line coverage; crate total 98%. One test had wrong data copied from the PLAN.md example (see decisions); fixed the test, not the code.
