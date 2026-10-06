@@ -43,6 +43,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
   - `OATH_HW_PASSWORD='...' cargo test --features hardware-tests --test hardware -- --test-threads=1` (protected key: unlock, wrong password, codes).
 - Frontend tests: `node --test static/` (Node's built-in runner, no npm, no package.json).
 - Browser check (headless Chrome over CDP, script kept in the session scratchpad, not the repo): no CSP violations or JS errors in dark or light mode; screenshots looked right.
+- Container: Rancher Desktop provides Docker 29.5 at `~/.rd/bin/docker` (not on PATH by default; `export PATH="$HOME/.rd/bin:$PATH"`). The Rancher VM has no pcscd and cannot see the USB key, so the container can only be checked up to the reader error locally.
 - Coverage gate excludes `card/pcsc.rs` and `main.rs`: `cargo llvm-cov --ignore-filename-regex '(card/pcsc\.rs|main\.rs)$'`.
 
 ## Manual hardware checklist (section 14.4) status
@@ -71,7 +72,7 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 | 11 | `api` (Dropshot) | done | API trait (`api::definition`), handlers (`api::server`), `auth`, `security`, `errors`, OpenAPI snapshot, 55 tests (+7 session/service) |
 | 12 | Real PC/SC card implementation | done | `card::pcsc::PcscCard`, `card::pick_reader`, `main` wiring, `tests/hardware.rs` (feature `hardware-tests`); 8 unit tests + 6 hardware tests |
 | 13 | Frontend | done | `static/{index.html,app.js,app.css}`, 13 JS tests (`node --test static/`), 7 Rust static-file rule tests, repo-wide em dash test |
-| 14 | Dockerfile and compose | files done, **image build not yet verified** | `Dockerfile`, `.dockerignore`, `docker-compose.yml`, 7 rule tests (`tests/container.rs`) |
+| 14 | Dockerfile and compose | done | `Dockerfile`, `.dockerignore`, `docker-compose.yml`, 7 rule tests (`tests/container.rs`) |
 | 15 | GitLab CI with coverage gate | todo | |
 | 16 | README | todo | |
 
@@ -181,3 +182,4 @@ Working notes for building `oath-web` as described in `PLAN.md`. Update this fil
 - 2026-10-06: HOTP counter confirmed untouched by the service (`755224` on first manual read). Counter is now 1.
 - 2026-10-06: Step 13 done. 269 Rust tests and 13 JS tests green, fmt and clippy clean. Checked in headless Chrome against the real key: both views render in dark and light mode, codes and countdown work, no CSP violations.
 - 2026-10-06: Step 14 files written; 7 container rule tests green. Image build still to verify on a container runtime.
+- 2026-10-06: Built the image with Rancher Desktop (Docker 29.5.3, linux/aarch64): 1.5 min cold build, 34.5 MB image, runs as uid 10001, ships `libpcsclite1 1.9.9-2` and `ca-certificates` only (no curl). Run with `--read-only --cap-drop ALL --security-opt no-new-privileges:true` it logs JSON and exits 1 with the "no usable smart card reader" hint, as expected without pcscd. `docker compose config` validates the compose file and the CSP label resolves intact. Step 14 done.
