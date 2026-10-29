@@ -1,0 +1,52 @@
+[package]
+name = "totem-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+totem = { path = ".." }
+
+# A separate workspace, so the fuzz crate (nightly only) never joins the
+# main build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "oath_responses"
+path = "fuzz_targets/oath_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_responses"
+path = "fuzz_targets/openpgp_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "card_chaining"
+path = "fuzz_targets/card_chaining.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_message"
+path = "fuzz_targets/openpgp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encrypted_message"
+path = "fuzz_targets/encrypted_message.rs"
+test = false
+doc = false
+bench = false

@@ -1,7 +1,10 @@
 # CI for totem (PLAN.md section 15, on GitHub Actions instead of GitLab).
 #
-# check -> test, frontend -> coverage -> image
+# check -> test, frontend, supply-chain, fuzz -> coverage -> image
 # The image is pushed to GHCR only for pushes to main and version tags.
+# supply-chain runs cargo-deny (advisories, licenses, bans, sources; see
+# deny.toml) and cargo-audit. fuzz runs every cargo-fuzz target in fuzz/
+# for a short time on nightly; run them longer locally (README).
 # Hardware tests (tests/hardware.rs) need a YubiKey and never run here; the
 # clippy job compiles them through --all-features.
 #
@@ -74,6 +77,54 @@ jobs:
           node-version: lts/*
       - run: node --test "static/*.test.js"
 
+  supply-chain:
+    name: cargo deny and cargo audit
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: Advisories, licenses, banned crates, and sources
+        run: cargo deny --locked check
+      - name: RustSec advisories (dev dependencies included)
+        run: cargo audit --deny warnings
+
+  fuzz:
+    name: cargo fuzz
+    needs: check
+    runs-on: ubuntu-latest
+    env:
+      FUZZ_SECONDS: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcsclite-dev pkg-config
+      - name: Install Rust
+        run: rustup toolchain install nightly --profile minimal && rustup default nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        with:
+          tool: cargo-fuzz
+      - name: Run every target
+        run: |
+          for target in $(cargo fuzz list); do
+            cargo fuzz run "$target" -- -max_total_time="$FUZZ_SECONDS"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   coverage:
     name: coverage gate
     needs: test
@@ -98,7 +149,7 @@ jobs:
         run: |
           cargo llvm-cov report --json --summary-only --output-path coverage.json --ignore-filename-regex "$COVERAGE_IGNORE"
           cargo llvm-cov report --cobertura --output-path cobertura.xml --ignore-filename-regex "$COVERAGE_IGNORE"
-      - name: Enforce thresholds (95% oath::*, session, ratelimit; 85% crate)
+      - name: Enforce thresholds (95% oath::*, openpgp::*, session, ratelimit; 85% crate)
         run: python3 ci/coverage_gate.py coverage.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -111,7 +162,7 @@ jobs:
 
   image:
     name: container image
-    needs: [test, frontend, coverage]
+    needs: [test, frontend, coverage, supply-chain, fuzz]
     runs-on: ubuntu-latest
     permissions:
       contents: read
