@@ -107,8 +107,18 @@ impl Response {
 /// Send `apdu`, then keep sending SEND REMAINING while the card answers
 /// `61xx`, concatenating the data. Returns the data and the final status word.
 pub fn transmit_chained<E: From<ProtoError>>(
+    transmit: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
+    apdu: &[u8],
+) -> Result<Response, E> {
+    transmit_chained_with(transmit, apdu, &send_remaining_apdu())
+}
+
+/// Like [`transmit_chained`], but fetch the rest of a `61xx` response with
+/// `next` (for example ISO GET RESPONSE) instead of SEND REMAINING.
+pub fn transmit_chained_with<E: From<ProtoError>>(
     mut transmit: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
     apdu: &[u8],
+    next: &[u8],
 ) -> Result<Response, E> {
     let mut response = Response::parse(&transmit(apdu)?)?;
     let mut rounds = 0;
@@ -117,9 +127,9 @@ pub fn transmit_chained<E: From<ProtoError>>(
         if rounds > MAX_CHAIN {
             return Err(ProtoError::Malformed("too many SEND REMAINING rounds").into());
         }
-        let next = Response::parse(&transmit(&send_remaining_apdu())?)?;
-        response.data.extend(next.data);
-        response.sw = next.sw;
+        let more = Response::parse(&transmit(next)?)?;
+        response.data.extend(more.data);
+        response.sw = more.sw;
     }
     Ok(response)
 }
@@ -502,6 +512,15 @@ mod tests {
             card.sent,
             vec![vec![0xAA], send_remaining_apdu(), send_remaining_apdu()]
         );
+    }
+
+    #[test]
+    fn chaining_can_use_another_continuation_apdu() {
+        let mut card = Script::new(&[&hex!("01026101"), &hex!("039000")]);
+        let get_response = hex!("00c0000000");
+        let response = transmit_chained_with(|a| card.transmit(a), &[0xAA], &get_response).unwrap();
+        assert_eq!(response.data, vec![1, 2, 3]);
+        assert_eq!(card.sent, vec![vec![0xAA], get_response.to_vec()]);
     }
 
     #[test]

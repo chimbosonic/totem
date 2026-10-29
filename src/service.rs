@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-use crate::card::{self, CardError, CardTransaction, OathCard};
+use crate::card::{self, Card, CardError, CardTransaction};
 use crate::clock::Clock;
 use crate::oath::crypto::{self, DerivedKey};
 use crate::oath::proto::{self, Command, EntryState, ProtoError, SelectResponse};
@@ -74,17 +74,13 @@ pub enum CredentialState {
 }
 
 pub struct Service {
-    card: Arc<Mutex<Box<dyn OathCard>>>,
+    card: Arc<Mutex<Box<dyn Card>>>,
     clock: Arc<dyn Clock>,
     rng: Arc<dyn ChallengeSource>,
 }
 
 impl Service {
-    pub fn new(
-        card: Box<dyn OathCard>,
-        clock: Arc<dyn Clock>,
-        rng: Arc<dyn ChallengeSource>,
-    ) -> Self {
+    pub fn new(card: Box<dyn Card>, clock: Arc<dyn Clock>, rng: Arc<dyn ChallengeSource>) -> Self {
         Self {
             card: Arc::new(Mutex::new(card)),
             clock,
@@ -156,10 +152,10 @@ impl Service {
 }
 
 fn with_retry<T>(
-    card: &mut dyn OathCard,
+    card: &mut dyn Card,
     op: &dyn Fn(&mut dyn CardTransaction) -> Result<T, CardError>,
 ) -> Result<T, ServiceError> {
-    let attempt = |card: &mut dyn OathCard| card.transaction().and_then(|mut tx| op(&mut *tx));
+    let attempt = |card: &mut dyn Card| card.transaction().and_then(|mut tx| op(&mut *tx));
     let result = match attempt(card) {
         Err(e) if e.needs_reconnect() => card.reconnect().and_then(|()| attempt(card)),
         other => other,
@@ -168,7 +164,7 @@ fn with_retry<T>(
 }
 
 /// Map the final card error of an operation to a service error.
-fn classify(card: &mut dyn OathCard, error: CardError) -> ServiceError {
+fn classify(card: &mut dyn Card, error: CardError) -> ServiceError {
     match error {
         CardError::Proto(ProtoError::WrongPassword) => ServiceError::WrongPassword,
         CardError::Proto(ProtoError::CardAuthFailed) => {

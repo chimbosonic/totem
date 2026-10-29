@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{CardError, CardTransaction, OathCard};
+use super::{Card, CardError, CardTransaction};
 use crate::oath::crypto::{self, Algorithm, DerivedKey};
 use crate::oath::proto::AID;
 use crate::oath::tlv;
@@ -354,7 +354,7 @@ impl Default for MockCard {
     }
 }
 
-impl OathCard for MockCard {
+impl Card for MockCard {
     fn transaction(&mut self) -> Result<Box<dyn CardTransaction + '_>, CardError> {
         self.state().events.push(MockEvent::Begin);
         Ok(Box::new(MockTransaction { card: self }))

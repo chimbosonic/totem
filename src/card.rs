@@ -1,4 +1,4 @@
-//! Card access. [`OathCard`] is implemented by the real PC/SC reader and by
+//! Card access. [`Card`] is implemented by the real PC/SC reader and by
 //! [`mock::MockCard`] for tests.
 
 pub mod mock;
@@ -33,7 +33,7 @@ pub trait CardTransaction {
     fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>, CardError>;
 }
 
-pub trait OathCard: Send {
+pub trait Card: Send {
     /// Begin an exclusive transaction.
     fn transaction(&mut self) -> Result<Box<dyn CardTransaction + '_>, CardError>;
 

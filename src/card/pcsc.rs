@@ -7,7 +7,7 @@ use std::ffi::CString;
 
 use pcsc::{Context, Protocols, Scope, ShareMode};
 
-use super::{CardError, CardTransaction, OathCard, pick_reader};
+use super::{Card, CardError, CardTransaction, pick_reader};
 
 pub struct PcscCard {
     filter: Option<String>,
@@ -54,7 +54,7 @@ fn open(filter: Option<&str>) -> Result<(Context, String, pcsc::Card), CardError
     Ok((context, reader, card))
 }
 
-impl OathCard for PcscCard {
+impl Card for PcscCard {
     fn transaction(&mut self) -> Result<Box<dyn CardTransaction + '_>, CardError> {
         let card = self.card.as_mut().ok_or(CardError::NoCard)?;
         let tx = card.transaction().map_err(map_error)?;

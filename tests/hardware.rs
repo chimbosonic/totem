@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use totem::card::pcsc::PcscCard;
-use totem::card::{OathCard, send};
+use totem::card::{Card, send};
 use totem::clock::{Clock, SystemClock};
 use totem::oath::crypto::{self, Algorithm};
 use totem::oath::proto::{self, Command};
