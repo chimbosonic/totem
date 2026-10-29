@@ -13,6 +13,24 @@
       }
     },
     "schemas": {
+      "AuthenticateRequest": {
+        "description": "Authenticate request. Deliberately has no `Debug`.",
+        "properties": {
+          "data": {
+            "description": "Base64 data for the authentication key to sign as is (INTERNAL AUTHENTICATE). For RSA keys, send a DigestInfo.",
+            "type": "string"
+          },
+          "pin": {
+            "description": "The OpenPGP user PIN (PW1). Used once and never stored.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data",
+          "pin"
+        ],
+        "type": "object"
+      },
       "CodesResponse": {
         "properties": {
           "credentials": {
@@ -124,6 +142,36 @@
         ],
         "type": "object"
       },
+      "DecryptRequest": {
+        "description": "Decrypt request. Deliberately has no `Debug`.",
+        "properties": {
+          "ciphertext": {
+            "description": "Base64. For RSA keys, the RSA ciphertext. For ECDH keys, the sender's ephemeral public point.",
+            "type": "string"
+          },
+          "pin": {
+            "description": "The OpenPGP user PIN (PW1). Used once and never stored.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ciphertext",
+          "pin"
+        ],
+        "type": "object"
+      },
+      "DecryptResponse": {
+        "properties": {
+          "plaintext": {
+            "description": "The decrypted session key, base64.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plaintext"
+        ],
+        "type": "object"
+      },
       "Error": {
         "description": "Error information from a response.",
         "properties": {
@@ -143,6 +191,15 @@
         ],
         "type": "object"
       },
+      "HashName": {
+        "description": "Hash that produced a digest.",
+        "enum": [
+          "sha256",
+          "sha384",
+          "sha512"
+        ],
+        "type": "string"
+      },
       "HealthResponse": {
         "properties": {
           "status": {
@@ -151,6 +208,232 @@
         },
         "required": [
           "status"
+        ],
+        "type": "object"
+      },
+      "KeySlotName": {
+        "description": "An OpenPGP key slot.",
+        "oneOf": [
+          {
+            "description": "The signature key.",
+            "enum": [
+              "sign"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The decryption key.",
+            "enum": [
+              "decrypt"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The authentication key.",
+            "enum": [
+              "auth"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "KeyStatusView": {
+        "properties": {
+          "algorithm": {
+            "description": "For example `rsa2048`, `nistp256`, or `ed25519`.",
+            "type": "string"
+          },
+          "created": {
+            "description": "Unix time the key was generated, if the card records it.",
+            "format": "uint32",
+            "minimum": 0,
+            "nullable": true,
+            "type": "integer"
+          },
+          "fingerprint": {
+            "description": "OpenPGP v4 fingerprint, 40 hex digits. Absent for an empty slot.",
+            "nullable": true,
+            "type": "string"
+          },
+          "slot": {
+            "$ref": "#/components/schemas/KeySlotName"
+          },
+          "touch_policy": {
+            "description": "`off`, `on`, `fixed`, `cached`, or `cached_fixed`. Keys with any policy but `off` need a touch, so this service refuses to use them.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "algorithm",
+          "slot",
+          "touch_policy"
+        ],
+        "type": "object"
+      },
+      "OpenPgpStatusResponse": {
+        "properties": {
+          "kdf_enabled": {
+            "description": "Whether the card expects PINs hashed (KDF). The service handles it.",
+            "type": "boolean"
+          },
+          "keys": {
+            "items": {
+              "$ref": "#/components/schemas/KeyStatusView"
+            },
+            "type": "array"
+          },
+          "pin_retries": {
+            "$ref": "#/components/schemas/PinRetriesView"
+          },
+          "serial": {
+            "description": "Card serial number, 8 hex digits.",
+            "type": "string"
+          },
+          "signature_counter": {
+            "description": "Signatures made with the signature key, if the card reports it.",
+            "format": "uint32",
+            "minimum": 0,
+            "nullable": true,
+            "type": "integer"
+          },
+          "version": {
+            "description": "Applet version, for example `3.4`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kdf_enabled",
+          "keys",
+          "pin_retries",
+          "serial",
+          "version"
+        ],
+        "type": "object"
+      },
+      "PinRetriesView": {
+        "description": "Tries left before each PIN blocks.",
+        "properties": {
+          "admin_pin": {
+            "description": "Admin PIN (PW3).",
+            "format": "uint8",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pin": {
+            "description": "User PIN (PW1).",
+            "format": "uint8",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reset_code": {
+            "description": "Reset code.",
+            "format": "uint8",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "admin_pin",
+          "pin",
+          "reset_code"
+        ],
+        "type": "object"
+      },
+      "PublicKeyResponse": {
+        "oneOf": [
+          {
+            "description": "An RSA key. Both values are unsigned big-endian integers, base64.",
+            "properties": {
+              "exponent": {
+                "type": "string"
+              },
+              "modulus": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "rsa"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "exponent",
+              "modulus",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An elliptic curve key: the public point, base64.",
+            "properties": {
+              "point": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "ec"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "point",
+              "type"
+            ],
+            "type": "object"
+          }
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string"
+          },
+          "fingerprint": {
+            "description": "OpenPGP v4 fingerprint, 40 hex digits.",
+            "type": "string"
+          },
+          "slot": {
+            "$ref": "#/components/schemas/KeySlotName"
+          }
+        },
+        "required": [
+          "algorithm",
+          "fingerprint",
+          "slot"
+        ],
+        "type": "object"
+      },
+      "SignRequest": {
+        "description": "Sign request. Deliberately has no `Debug`, so the PIN cannot end up in a log by accident.",
+        "properties": {
+          "digest": {
+            "description": "The digest to sign, base64. The card wraps it in a DigestInfo for RSA keys and signs it as is for ECDSA and EdDSA keys.",
+            "type": "string"
+          },
+          "hash": {
+            "$ref": "#/components/schemas/HashName"
+          },
+          "pin": {
+            "description": "The OpenPGP user PIN (PW1). Used once and never stored.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "digest",
+          "hash",
+          "pin"
+        ],
+        "type": "object"
+      },
+      "SignatureResponse": {
+        "properties": {
+          "signature": {
+            "description": "The signature, base64.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "signature"
         ],
         "type": "object"
       },
@@ -170,7 +453,7 @@
     }
   },
   "info": {
-    "description": "Read TOTP codes from a YubiKey OATH applet.",
+    "description": "Read TOTP codes from a YubiKey OATH applet, and use the keys in its OpenPGP applet.",
     "title": "totem",
     "version": "0.1.0"
   },
@@ -215,6 +498,166 @@
           }
         },
         "summary": "End the current session."
+      }
+    },
+    "/api/openpgp": {
+      "get": {
+        "operationId": "openpgp_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenPgpStatusResponse"
+                }
+              }
+            },
+            "description": "successful operation"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "OpenPGP applet status: keys, PIN retry counters, signature count."
+      }
+    },
+    "/api/openpgp/authenticate": {
+      "post": {
+        "operationId": "openpgp_authenticate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthenticateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignatureResponse"
+                }
+              }
+            },
+            "description": "successful operation"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Sign data with the OpenPGP authentication key. Needs the user PIN."
+      }
+    },
+    "/api/openpgp/decrypt": {
+      "post": {
+        "operationId": "openpgp_decrypt",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecryptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecryptResponse"
+                }
+              }
+            },
+            "description": "successful operation"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Decrypt a session key with the OpenPGP decryption key. Needs the PIN."
+      }
+    },
+    "/api/openpgp/keys/{slot}": {
+      "get": {
+        "operationId": "openpgp_public_key",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slot",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeySlotName"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicKeyResponse"
+                }
+              }
+            },
+            "description": "successful operation"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "The public key in an OpenPGP key slot."
+      }
+    },
+    "/api/openpgp/sign": {
+      "post": {
+        "operationId": "openpgp_sign",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignatureResponse"
+                }
+              }
+            },
+            "description": "successful operation"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Sign a digest with the OpenPGP signature key. Needs the user PIN."
       }
     },
     "/api/unlock": {

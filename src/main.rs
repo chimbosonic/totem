@@ -38,7 +38,10 @@ async fn main() -> anyhow::Result<()> {
 
     let clock = Arc::new(SystemClock);
     let rng = Arc::new(OsChallengeSource);
-    let service = Arc::new(Service::new(Box::new(card), clock.clone(), rng.clone()));
+    let service = Arc::new(
+        Service::new(Box::new(card), clock.clone(), rng.clone())
+            .with_pin_retry_floor(config.openpgp_pin_retry_floor),
+    );
 
     match service.startup_check().await {
         Ok(info) => {
@@ -56,6 +59,33 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // OpenPGP is optional: report what is there and carry on either way.
+    match service.openpgp_status().await {
+        Ok(status) => {
+            let keys: Vec<&str> = status
+                .keys
+                .iter()
+                .filter(|k| k.fingerprint.is_some())
+                .map(|k| k.slot.name())
+                .collect();
+            info!(log, "OpenPGP applet ready";
+                "applet_version" => &status.version,
+                "keys" => keys.join(","),
+                "pin_retries" => status.pin_retries.pin,
+                "pin_retry_floor" => config.openpgp_pin_retry_floor,
+            );
+        }
+        Err(ServiceError::OpenPgpUnavailable) => {
+            info!(
+                log,
+                "no OpenPGP applet on the card; the OpenPGP endpoints will answer 404"
+            );
+        }
+        Err(e) => {
+            error!(log, "OpenPGP applet check failed; continuing without it"; "error" => %e);
+        }
+    }
+
     let sessions = Arc::new(SessionStore::new(
         clock.clone(),
         rng,
@@ -66,7 +96,8 @@ async fn main() -> anyhow::Result<()> {
     let context = ApiContext {
         service,
         sessions,
-        ratelimit: Arc::new(RateLimiter::new(clock, config.global_fail_limit)),
+        ratelimit: Arc::new(RateLimiter::new(clock.clone(), config.global_fail_limit)),
+        pin_ratelimit: Arc::new(RateLimiter::new(clock, config.openpgp_global_fail_limit)),
         config: config.clone(),
     };
 

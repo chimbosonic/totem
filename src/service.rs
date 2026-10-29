@@ -4,6 +4,8 @@
 //! thread pool. Every operation is a fresh SELECT inside one transaction;
 //! nothing relies on the card staying unlocked between requests.
 
+mod openpgp;
+
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -13,8 +15,11 @@ use crate::card::{self, Card, CardError, CardTransaction};
 use crate::clock::Clock;
 use crate::oath::crypto::{self, DerivedKey};
 use crate::oath::proto::{self, Command, EntryState, ProtoError, SelectResponse};
+use crate::openpgp::proto::{InputError, KeySlot, PgpError};
 use crate::rng::ChallengeSource;
 use crate::session::AuthedSession;
+
+pub use openpgp::{DEFAULT_PIN_RETRY_FLOOR, KeyStatus, OpenPgpStatus, PinRetries, PublicKeyInfo};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ServiceError {
@@ -31,6 +36,26 @@ pub enum ServiceError {
     Protocol(ProtoError),
     #[error("internal error running card operation")]
     Internal,
+    #[error("no OpenPGP applet on the card")]
+    OpenPgpUnavailable,
+    #[error("no key in the {0} slot")]
+    NoKey(KeySlot),
+    #[error("wrong OpenPGP PIN, {retries_left} tries left")]
+    WrongPin { retries_left: u8 },
+    /// Trying the PIN could leave too few retries, so it was not sent.
+    #[error("OpenPGP PIN has {retries_left} tries left, at or below the floor")]
+    PinRetryFloor { retries_left: u8 },
+    #[error("OpenPGP PIN length is outside what the card accepts")]
+    BadPin,
+    /// The key needs a touch, which nobody at the server can give.
+    #[error("the {0} key requires a touch")]
+    TouchRequired(KeySlot),
+    #[error("the card's PIN KDF is not supported")]
+    KdfUnsupported,
+    #[error("bad input: {0}")]
+    BadInput(InputError),
+    #[error("OpenPGP protocol error: {0}")]
+    OpenPgpProtocol(PgpError),
 }
 
 /// What the startup check learned about the applet.
@@ -77,6 +102,7 @@ pub struct Service {
     card: Arc<Mutex<Box<dyn Card>>>,
     clock: Arc<dyn Clock>,
     rng: Arc<dyn ChallengeSource>,
+    pin_retry_floor: u8,
 }
 
 impl Service {
@@ -85,7 +111,15 @@ impl Service {
             card: Arc::new(Mutex::new(card)),
             clock,
             rng,
+            pin_retry_floor: DEFAULT_PIN_RETRY_FLOOR,
         }
+    }
+
+    /// Never send an OpenPGP PIN when the card has this many retries or
+    /// fewer left, so the API cannot block the PIN.
+    pub fn with_pin_retry_floor(mut self, floor: u8) -> Self {
+        self.pin_retry_floor = floor;
+        self
     }
 
     /// SELECT the applet and refuse to continue if it has no password.
@@ -173,6 +207,8 @@ fn classify(card: &mut dyn Card, error: CardError) -> ServiceError {
             ServiceError::CardAuthFailed
         }
         CardError::Proto(other) => ServiceError::Protocol(other),
+        CardError::OpenPgp(PgpError::NotInstalled) => ServiceError::OpenPgpUnavailable,
+        CardError::OpenPgp(other) => ServiceError::OpenPgpProtocol(other),
         // Only reached after the reconnect and retry in `with_retry`.
         transport => ServiceError::Unavailable(transport),
     }

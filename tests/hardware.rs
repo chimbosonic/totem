@@ -12,6 +12,11 @@
 //! OATH_HW_PASSWORD='...' cargo test --features hardware-tests --test hardware -- --test-threads=1
 //! ```
 //!
+//! `OATH_HW_OPENPGP_PIN` is the OpenPGP user PIN. With it, the OpenPGP
+//! tests sign with the key in the signature slot. They never send a wrong
+//! PIN and refuse to send any PIN when 2 or fewer tries are left. Without
+//! it, they only read the status and public keys.
+//!
 //! `OATH_HW_DERIVED_KEY` (hex) is the PBKDF2 fixture from PLAN.md section
 //! 14.4, computed independently of this crate (see
 //! `hw_pbkdf2_matches_independent_fixture`). It unlocks the key just like the
@@ -20,11 +25,13 @@
 
 use std::sync::Arc;
 
+use sha2::Digest;
 use totem::card::pcsc::PcscCard;
 use totem::card::{Card, send};
 use totem::clock::{Clock, SystemClock};
 use totem::oath::crypto::{self, Algorithm};
 use totem::oath::proto::{self, Command};
+use totem::openpgp::proto::{self as openpgp, HashAlgorithm, KeySlot, PublicKey};
 use totem::rng::OsChallengeSource;
 use totem::service::{CredentialState, Service, ServiceError};
 use totem::session::SessionStore;
@@ -271,4 +278,108 @@ async fn hw_hotp_is_listed_without_a_code() {
         .find(|c| c.issuer == "RFC4226" && c.account == "sha1")
         .expect("RFC4226:sha1 HOTP credential on the key");
     assert_eq!(credential.state, CredentialState::Hotp);
+}
+
+// OpenPGP
+
+fn openpgp_pin() -> Option<String> {
+    std::env::var("OATH_HW_OPENPGP_PIN").ok()
+}
+
+/// Keep two tries in reserve on a real key, one more than the default.
+fn openpgp_service() -> Service {
+    service().with_pin_retry_floor(2)
+}
+
+#[tokio::test]
+async fn hw_openpgp_status_and_public_keys() {
+    let svc = openpgp_service();
+    let status = svc.openpgp_status().await.expect("OpenPGP status");
+    println!(
+        "OpenPGP {} serial {} retries {:?} signatures {:?}",
+        status.version, status.serial, status.pin_retries, status.signature_counter
+    );
+    assert!(!status.version.is_empty());
+    assert_eq!(status.serial.len(), 8);
+    for key in &status.keys {
+        println!(
+            "  {}: {} {:?} touch {}",
+            key.slot, key.algorithm, key.fingerprint, key.touch_policy
+        );
+        let result = svc.openpgp_public_key(key.slot).await;
+        match &key.fingerprint {
+            None => assert_eq!(result, Err(ServiceError::NoKey(key.slot))),
+            Some(fingerprint) => {
+                let info = result.expect("public key");
+                assert_eq!(&info.fingerprint, fingerprint);
+                assert_eq!(info.algorithm, key.algorithm);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn hw_openpgp_rsa_signature_verifies_against_the_card_key() {
+    let Some(pin) = openpgp_pin() else {
+        println!("OATH_HW_OPENPGP_PIN not set; skipping the signature check");
+        return;
+    };
+    let svc = openpgp_service();
+    let status = svc.openpgp_status().await.expect("OpenPGP status");
+    let sign = &status.keys[0];
+    if sign.fingerprint.is_none() {
+        println!("no key in the signature slot; skipping");
+        return;
+    }
+    if sign.touch_policy != "off" {
+        // The service would refuse with TouchRequired before sending the
+        // PIN; skip rather than fail, since the key is set up that way.
+        println!(
+            "signature key has touch policy {}; skipping",
+            sign.touch_policy
+        );
+        return;
+    }
+    println!("KDF enabled: {}", status.kdf_enabled);
+    assert!(
+        status.pin_retries.pin > 2,
+        "only {} PIN tries left; reset them at the host before running this",
+        status.pin_retries.pin
+    );
+    let digest = sha2::Sha256::digest(b"totem hardware test");
+    let signature = svc
+        .openpgp_sign(Zeroizing::new(pin), HashAlgorithm::Sha256, digest.to_vec())
+        .await
+        .expect("sign");
+    let after = svc.openpgp_status().await.unwrap();
+    assert_eq!(after.pin_retries.pin, status.pin_retries.pin);
+    if let (Some(before), Some(now)) = (status.signature_counter, after.signature_counter) {
+        assert_eq!(now, before + 1);
+    }
+    let info = svc.openpgp_public_key(KeySlot::Sign).await.unwrap();
+    let PublicKey::Rsa { modulus, exponent } = info.key else {
+        println!(
+            "signature key is {}, not RSA; checked length only",
+            info.algorithm
+        );
+        assert!(!signature.is_empty());
+        return;
+    };
+    let key = rsa::RsaPublicKey::new(
+        rsa::BigUint::from_bytes_be(&modulus),
+        rsa::BigUint::from_bytes_be(&exponent),
+    )
+    .unwrap();
+    let digest_info = openpgp::signature_input(
+        &openpgp::Algorithm::Rsa { bits: 0 },
+        HashAlgorithm::Sha256,
+        &digest,
+    )
+    .unwrap();
+    key.verify(
+        rsa::Pkcs1v15Sign::new_unprefixed(),
+        &digest_info,
+        &signature,
+    )
+    .expect("card signature verifies with the card's public key");
 }

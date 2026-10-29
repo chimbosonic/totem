@@ -1,7 +1,9 @@
 # totem
 
 A web front end for YubiKey features, run on the host the key is plugged into.
-Today it covers the OATH applet; more of the key's features are planned.
+Today it covers the OATH applet (TOTP codes on a web page) and, over the
+API, the OpenPGP applet (sign, decrypt, and authenticate with keys already on
+the key, so it can act as a small network HSM).
 
 The current release is a small Rust service that reads TOTP codes from a
 YubiKey's OATH applet over PC/SC and shows them on an internal web page.
@@ -15,7 +17,9 @@ Access is gated by the OATH password set on the key itself.
 What it does not do: add, rename, or delete credentials (use `ykman` on the
 host), compute HOTP codes (that would advance the counter), or compute
 touch-required codes (nobody is at the server to touch the key). HOTP and
-touch-required credentials are listed without a code.
+touch-required credentials are listed without a code. For OpenPGP it never
+generates, imports, or exports keys, and never changes a PIN (use `gpg
+--card-edit` or `ykman openpgp` on the host).
 
 ## How it works
 
@@ -86,6 +90,8 @@ startup with a message naming the variable.
 | `OATH_GLOBAL_FAIL_LIMIT` | `20` | Wrong passwords within 15 minutes, from all clients together, that lock unlocking for everyone for 15 minutes |
 | `OATH_TRUSTED_PROXIES` | unset | Comma-separated CIDRs (or single IPs) allowed to set `X-Forwarded-For` |
 | `OATH_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warning`, `error`, or `critical` |
+| `OATH_OPENPGP_PIN_RETRY_FLOOR` | `1` | `0`, `1`, or `2`. The OpenPGP PIN is never sent when the key has this many tries left or fewer (see [OpenPGP](#openpgp)) |
+| `OATH_OPENPGP_GLOBAL_FAIL_LIMIT` | `10` | Wrong OpenPGP PINs within 15 minutes, from all clients together, that stop PIN use for everyone for 15 minutes |
 
 ## Container
 
@@ -164,11 +170,15 @@ Protects against:
   (1 s up to 5 minutes), only one attempt per client can run at a time, and
   `OATH_GLOBAL_FAIL_LIMIT` failures within 15 minutes lock unlocking for
   everyone for 15 minutes.
-- Secret extraction: TOTP secrets never leave the key.
+- Secret extraction: TOTP secrets and OpenPGP private keys never leave the
+  key.
+- Blocking the OpenPGP PIN through the API: see [OpenPGP](#openpgp).
 
 Does not protect against:
 
-- Anyone who knows the password and can reach the page.
+- Anyone who knows the password and can reach the page. For OpenPGP, anyone
+  who knows both the OATH password and the OpenPGP PIN can sign and decrypt
+  with the key for as long as they can reach the service.
 - A compromised host or container requesting codes while a session is live.
 - A compromised reverse proxy.
 
@@ -177,10 +187,15 @@ The second factor becomes "knows the password and is on the LAN" rather than
 
 ### What is never logged
 
-The password, the derived key, raw session IDs, and codes. Audit events
-(`unlock_success`, `unlock_failure`, `global_lockout_engaged`,
-`codes_fetched`, `lock`, `card_error`) log the client IP and a short hash of
-the session ID. Tests check that none of the secrets appear in the logs.
+The password, the derived key, raw session IDs, and codes. For OpenPGP, the
+PIN and the data: digests, ciphertexts, plaintexts, and signatures. Audit
+events (`unlock_success`, `unlock_failure`, `global_lockout_engaged`,
+`codes_fetched`, `lock`, `card_error`, `openpgp_sign`, `openpgp_decrypt`,
+`openpgp_authenticate`, `openpgp_pin_failure`, `openpgp_pin_lockout_engaged`,
+`openpgp_pin_floor_reached`) log the client IP and a short hash of the
+session ID. OpenPGP use events also log the key slot and the first 4 bytes of
+the SHA-256 of the input, so requests can be matched up without logging the
+input. Tests check that none of the secrets appear in the logs.
 
 ## API
 
@@ -192,6 +207,11 @@ the session ID. Tests check that none of the secrets appear in the logs.
 | POST | `/api/unlock` | none | `204` and session cookie; `401` wrong password; `429` with `Retry-After` |
 | POST | `/api/lock` | session | `204` |
 | GET | `/api/codes` | session | `200` JSON; `401` no or expired session; `503` key unavailable |
+| GET | `/api/openpgp` | session | `200` keys, PIN retry counters, signature count; `404` no OpenPGP applet |
+| GET | `/api/openpgp/keys/{slot}` | session | `200` public key of `sign`, `decrypt`, or `auth`; `404` empty slot |
+| POST | `/api/openpgp/sign` | session + PIN | `200` signature over a digest |
+| POST | `/api/openpgp/decrypt` | session + PIN | `200` decrypted session key |
+| POST | `/api/openpgp/authenticate` | session + PIN | `200` signature with the authentication key |
 | GET | `/healthz` | none | `200` if the key is reachable and password protected, else `503` |
 
 POST requests must send `Content-Type: application/json`. The session cookie
@@ -199,6 +219,61 @@ is `HttpOnly; Secure; SameSite=Strict`. The full schema is in
 [`openapi/totem.json`](openapi/totem.json), generated from the code by
 Dropshot. The running service also serves it at `/openapi.json`, and renders
 it at `/docs` (linked from the main page).
+
+### OpenPGP
+
+The OpenPGP endpoints use keys already on the key. They need an unlocked
+session (the OATH password) and, for sign, decrypt, and authenticate, the
+OpenPGP user PIN in the request body. The PIN is used for that one request
+and never stored. Binary values are base64.
+
+```sh
+# After POST /api/unlock, with the session cookie in $COOKIE:
+curl -s -b "$COOKIE" https://totem.lan/api/openpgp
+digest=$(printf 'hello' | openssl dgst -sha256 -binary | base64)
+curl -s -b "$COOKIE" -H 'content-type: application/json' \
+  -d "{\"pin\":\"$PIN\",\"hash\":\"sha256\",\"digest\":\"$digest\"}" \
+  https://totem.lan/api/openpgp/sign
+```
+
+- Sign takes a digest and the hash that made it (`sha256`, `sha384`, or
+  `sha512`). For RSA keys the service wraps it in a PKCS #1 DigestInfo; for
+  ECDSA and EdDSA keys it is signed as is.
+- Decrypt takes the RSA ciphertext for RSA keys, or the sender's ephemeral
+  public point for ECDH keys, and returns the session key.
+- Authenticate signs `data` as is with the authentication key. For RSA keys,
+  send a DigestInfo.
+
+The key blocks its PIN after 3 wrong tries. To make sure the API can never
+do that, the service reads the retry counter before every PIN check and
+refuses with `423 PinRetryFloor`, without sending the PIN, once the key has
+`OATH_OPENPGP_PIN_RETRY_FLOOR` tries left or fewer. With the default of 1,
+the last try is always kept for a person at the host, who resets the counter
+by entering the right PIN there (for example with `gpg --card-status` and a
+signature, or `gpg --card-edit`). Requests that could not succeed (bad
+base64, a digest of the wrong length, an empty slot, a PIN shorter than 6
+characters) are refused before the PIN is sent, so they never cost a try.
+
+Keys with a touch policy (`ykman openpgp info` shows anything but "Off")
+cannot be used: nobody is at the server to touch the key. The service reads
+each key's policy, shows it as `touch_policy` in `GET /api/openpgp`, and
+refuses to use such a key with `409 TouchRequired` before sending the PIN.
+Turn touch off at the host with `ykman openpgp keys set-touch <key> off`
+(not possible for the `fixed` and `cached_fixed` policies, short of
+replacing the key).
+
+Cards set up with a PIN KDF (`gpg --card-edit`, then `kdf-setup`; shown as
+"KDF enabled" in `ykman openpgp info` and `kdf_enabled` in
+`GET /api/openpgp`) expect the PIN hashed rather than as typed. The service
+reads the card's KDF settings and sends the iterated and salted S2K hash,
+as gpg does, so the PIN in the request stays the plain PIN. A KDF it does
+not know is refused with `501 KdfUnsupported`, again without sending the
+PIN.
+
+Wrong PINs answer `403 WrongPin` with the tries left, and also count against
+a rate limit like the one for unlocking: each wrong PIN doubles that client's
+wait, and `OATH_OPENPGP_GLOBAL_FAIL_LIMIT` failures within 15 minutes stop PIN
+use for everyone for 15 minutes. That limit is separate from the unlock one.
 
 ## Development
 
@@ -268,6 +343,19 @@ OATH_HW_PASSWORD=...
 OATH_HW_DERIVED_KEY=...
 ```
 
+For the OpenPGP hardware tests, also put the OpenPGP user PIN in `.env`.
+They read the status and public keys, sign with any key in the signature
+slot, and check RSA signatures against the card's public key. They never
+send a wrong PIN, stop if the key has 2 tries or fewer left, and skip
+signing when the signature key has a touch policy. Stop gpg's `scdaemon`
+first (`gpgconf --kill scdaemon`): by default it holds the key exclusively
+and every test fails with "other connections outstanding". Adding
+`pcsc-shared` to `~/.gnupg/scdaemon.conf` lets them share it.
+
+```sh
+OATH_HW_OPENPGP_PIN=...
+```
+
 Then:
 
 ```sh
@@ -284,6 +372,8 @@ sh -c 'set -a; . ./.env; set +a; cargo test --features hardware-tests --test har
 5. Unplug and replug the key while the page is open: the page should show
    "YubiKey unavailable" and recover on its own once the key is back.
 6. Confirm the logs contain no password or codes.
+7. With an OpenPGP key on the card: sign through the API and verify with
+   `gpg --verify` or `openssl`; check `/docs` renders.
 
 ## Project notes
 

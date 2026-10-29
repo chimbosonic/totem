@@ -97,6 +97,18 @@ pub async fn acquire_unlock_attempt(
     acquire_unlock_attempt_for(&rqctx.context().ratelimit, client_ip(rqctx))
 }
 
+/// Reserve an OpenPGP PIN attempt for the request's client, or a 429. PIN
+/// attempts have their own limiter, so they never lock out OATH unlock.
+pub fn acquire_pin_attempt(
+    rqctx: &RequestContext<ApiContext>,
+) -> Result<UnlockPermit<'_>, HttpError> {
+    rqctx
+        .context()
+        .pin_ratelimit
+        .acquire(client_ip(rqctx))
+        .map_err(errors::too_many_pin_attempts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

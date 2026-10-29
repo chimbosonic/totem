@@ -53,7 +53,7 @@ fn readme_documents_every_config_variable() {
         .collect();
     vars.sort_unstable();
     vars.dedup();
-    assert_eq!(vars.len(), 7, "{vars:?}");
+    assert_eq!(vars.len(), 9, "{vars:?}");
     let missing: Vec<_> = vars
         .iter()
         .filter(|v| !readme.contains(&format!("`{v}`")))

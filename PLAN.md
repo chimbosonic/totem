@@ -12,6 +12,7 @@ The project is named `totem`. This plan covers its first remit, OATH (TOTP codes
 - Unlock using the key's own OATH password, entered on the web page.
 - Show codes with a countdown, copy button, and lock button.
 - Run as a single container, internal network only, behind the existing Traefik v3 setup.
+- Added 2026-10-29: OpenPGP applet over the API (status, public keys, sign, decrypt, authenticate) with keys already on the card, PIN per request, and a retry floor so the API can never block the PIN. API docs page at `/docs` rendering the Dropshot-generated `/openapi.json`.
 
 **Out of scope**
 
@@ -20,6 +21,7 @@ The project is named `totem`. This plan covers its first remit, OATH (TOTP codes
 - Touch-required credentials (nobody is at the server to touch the key; listed as unavailable).
 - Multi-user accounts. One shared password, which is the OATH password.
 - Public internet exposure.
+- OpenPGP key generation, import, export, and PIN changes (use `gpg --card-edit` or `ykman openpgp` on the host).
 
 ## 2. Constraints for the agent
 

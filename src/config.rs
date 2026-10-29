@@ -21,6 +21,12 @@ pub struct Config {
     pub trusted_proxies: Vec<IpNet>,
     /// `OATH_LOG_LEVEL`: minimum log level.
     pub log_level: Level,
+    /// `OATH_OPENPGP_PIN_RETRY_FLOOR`: never send an OpenPGP PIN when the
+    /// card has this many tries or fewer left.
+    pub openpgp_pin_retry_floor: u8,
+    /// `OATH_OPENPGP_GLOBAL_FAIL_LIMIT`: wrong OpenPGP PINs before the
+    /// global PIN lockout.
+    pub openpgp_global_fail_limit: u32,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -72,6 +78,20 @@ impl Config {
             None => Level::Info,
             Some(v) => parse_level(&v)?,
         };
+        let openpgp_pin_retry_floor = match get("OATH_OPENPGP_PIN_RETRY_FLOOR") {
+            None => crate::service::DEFAULT_PIN_RETRY_FLOOR,
+            Some(v) => match v.parse::<u8>() {
+                Ok(n) if n <= MAX_PIN_RETRY_FLOOR => n,
+                _ => {
+                    return Err(invalid(
+                        "OATH_OPENPGP_PIN_RETRY_FLOOR",
+                        &v,
+                        "expected 0, 1, or 2",
+                    ));
+                }
+            },
+        };
+        let openpgp_global_fail_limit = positive(get, "OATH_OPENPGP_GLOBAL_FAIL_LIMIT", 10)?;
 
         Ok(Self {
             bind,
@@ -81,9 +101,15 @@ impl Config {
             global_fail_limit,
             trusted_proxies,
             log_level,
+            openpgp_pin_retry_floor,
+            openpgp_global_fail_limit,
         })
     }
 }
+
+/// Highest allowed retry floor. A card starts with 3 tries, so a floor of 3
+/// would never allow one.
+const MAX_PIN_RETRY_FLOOR: u8 = 2;
 
 fn invalid(var: &'static str, value: &str, reason: &'static str) -> ConfigError {
     ConfigError::Invalid {
@@ -181,6 +207,8 @@ mod tests {
                 global_fail_limit: 20,
                 trusted_proxies: vec![],
                 log_level: Level::Info,
+                openpgp_pin_retry_floor: 1,
+                openpgp_global_fail_limit: 10,
             }
         );
     }
@@ -195,8 +223,12 @@ mod tests {
             ("OATH_GLOBAL_FAIL_LIMIT", "5"),
             ("OATH_TRUSTED_PROXIES", "172.16.0.0/12, 10.0.0.0/8"),
             ("OATH_LOG_LEVEL", "debug"),
+            ("OATH_OPENPGP_PIN_RETRY_FLOOR", "2"),
+            ("OATH_OPENPGP_GLOBAL_FAIL_LIMIT", "4"),
         ])
         .unwrap();
+        assert_eq!(config.openpgp_pin_retry_floor, 2);
+        assert_eq!(config.openpgp_global_fail_limit, 4);
         assert_eq!(config.bind, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(config.reader.as_deref(), Some("Yubico YubiKey NEO"));
         assert_eq!(config.session_idle_secs, 60);
@@ -210,6 +242,29 @@ mod tests {
             ]
         );
         assert_eq!(config.log_level, Level::Debug);
+    }
+
+    #[test]
+    fn pin_retry_floor_accepts_0_to_2_only() {
+        for (value, floor) in [("0", 0), ("1", 1), ("2", 2)] {
+            let config = parse(&[("OATH_OPENPGP_PIN_RETRY_FLOOR", value)]).unwrap();
+            assert_eq!(config.openpgp_pin_retry_floor, floor);
+        }
+        for bad in ["3", "-1", "one", "256"] {
+            assert_eq!(
+                invalid_var(parse(&[("OATH_OPENPGP_PIN_RETRY_FLOOR", bad)])),
+                "OATH_OPENPGP_PIN_RETRY_FLOOR",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_pin_fail_limit_is_rejected() {
+        assert_eq!(
+            invalid_var(parse(&[("OATH_OPENPGP_GLOBAL_FAIL_LIMIT", "0")])),
+            "OATH_OPENPGP_GLOBAL_FAIL_LIMIT"
+        );
     }
 
     #[test]
