@@ -13,7 +13,7 @@
   <header>
     <div class="title">
       <h1>totem</h1>
-      <div class="subtitle">TOTP codes from the YubiKey on this server</div>
+      <div class="subtitle">TOTP codes and OpenPGP keys on the YubiKey on this server</div>
     </div>
     <div class="badge"><span class="dot locked" id="state-dot"></span><span id="state-text">Locked</span></div>
   </header>
@@ -34,10 +34,71 @@
 
     <section id="unlocked-view" hidden>
       <div class="toolbar">
-        <p class="message" id="codes-message" role="status" aria-live="polite"></p>
+        <div class="tabs" role="tablist" aria-label="Views">
+          <button type="button" class="tab" role="tab" id="tab-codes" aria-selected="true" aria-controls="codes-panel">Codes</button>
+          <button type="button" class="tab" role="tab" id="tab-openpgp" aria-selected="false" aria-controls="openpgp-panel" tabindex="-1">OpenPGP</button>
+        </div>
         <button type="button" id="lock-button">Lock</button>
       </div>
-      <div class="grid" id="codes"></div>
+
+      <div id="codes-panel" role="tabpanel" aria-labelledby="tab-codes">
+        <p class="message" id="codes-message" role="status" aria-live="polite"></p>
+        <div class="grid" id="codes"></div>
+      </div>
+
+      <div id="openpgp-panel" role="tabpanel" aria-labelledby="tab-openpgp" hidden>
+        <div class="toolbar">
+          <p class="message" id="openpgp-message" role="status" aria-live="polite"></p>
+          <button type="button" id="openpgp-refresh">Refresh</button>
+        </div>
+        <div class="grid">
+          <section class="panel" id="openpgp-card" hidden>
+            <div class="section-title">OpenPGP card</div>
+            <dl class="facts" id="openpgp-facts"></dl>
+          </section>
+          <div class="grid" id="openpgp-keys"></div>
+          <section class="panel" id="openpgp-use" hidden>
+            <div class="section-title">Use a key</div>
+            <form class="stack" id="openpgp-form">
+              <label class="k" for="openpgp-operation">Operation</label>
+              <select id="openpgp-operation">
+                <option value="decrypt-message">Decrypt an OpenPGP message</option>
+                <option value="clearsign">OpenPGP clearsigned message</option>
+                <option value="detached">OpenPGP detached signature (armored)</option>
+              </select>
+              <div class="help" id="openpgp-decrypt-help" hidden>
+                <p>How this works:</p>
+                <ol>
+                  <li>Paste the whole encrypted message, from <code>-----BEGIN PGP MESSAGE-----</code> to <code>-----END PGP MESSAGE-----</code>.</li>
+                  <li>Enter your OpenPGP PIN. The YubiKey recovers the message's session key; this server never decrypts the message.</li>
+                  <li>Save the message as <code>message.asc</code> on your own machine and run one of the commands shown, with gpg or Sequoia (sq). They decrypt it with the session key, without needing your private key.</li>
+                </ol>
+                <p class="note">The session key opens this one message only. Treat it like the message itself.</p>
+              </div>
+              <div class="stack" id="openpgp-sign-options">
+                <label class="k" for="openpgp-hash">Hash</label>
+                <select id="openpgp-hash">
+                  <option value="sha256">SHA-256</option>
+                  <option value="sha384">SHA-384</option>
+                  <option value="sha512">SHA-512</option>
+                </select>
+              </div>
+              <label class="k" for="openpgp-input" id="openpgp-input-label">Text to sign</label>
+              <textarea id="openpgp-input" rows="4" spellcheck="false" required></textarea>
+              <label class="k" for="openpgp-pin">OpenPGP PIN</label>
+              <input type="password" id="openpgp-pin" name="openpgp-pin" autocomplete="off" required>
+              <div><button type="submit" id="openpgp-submit">Run</button></div>
+            </form>
+            <p class="message" id="openpgp-use-message" role="status" aria-live="polite"></p>
+            <div class="result" id="openpgp-result" hidden>
+              <div class="k" id="openpgp-result-label">Result</div>
+              <pre class="output" id="openpgp-output"></pre>
+              <div class="actions" id="openpgp-result-actions"></div>
+              <div class="stack" id="openpgp-instructions" hidden></div>
+            </div>
+          </section>
+        </div>
+      </div>
     </section>
   </main>
 

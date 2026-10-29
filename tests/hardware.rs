@@ -25,12 +25,12 @@
 
 use std::sync::Arc;
 
-use sha2::Digest;
 use totem::card::pcsc::PcscCard;
 use totem::card::{Card, send};
 use totem::clock::{Clock, SystemClock};
 use totem::oath::crypto::{self, Algorithm};
 use totem::oath::proto::{self, Command};
+use totem::openpgp::message::{self, Format, SignatureBuilder};
 use totem::openpgp::proto::{self as openpgp, HashAlgorithm, KeySlot, PublicKey};
 use totem::rng::OsChallengeSource;
 use totem::service::{CredentialState, Service, ServiceError};
@@ -346,11 +346,17 @@ async fn hw_openpgp_rsa_signature_verifies_against_the_card_key() {
         "only {} PIN tries left; reset them at the host before running this",
         status.pin_retries.pin
     );
-    let digest = sha2::Sha256::digest(b"totem hardware test");
-    let signature = svc
-        .openpgp_sign(Zeroizing::new(pin), HashAlgorithm::Sha256, digest.to_vec())
+    let text = "totem hardware test";
+    let armored = svc
+        .openpgp_sign_message(
+            Zeroizing::new(pin),
+            HashAlgorithm::Sha256,
+            Format::Detached,
+            text.into(),
+        )
         .await
         .expect("sign");
+    println!("{armored}");
     let after = svc.openpgp_status().await.unwrap();
     assert_eq!(after.pin_retries.pin, status.pin_retries.pin);
     if let (Some(before), Some(now)) = (status.signature_counter, after.signature_counter) {
@@ -359,27 +365,94 @@ async fn hw_openpgp_rsa_signature_verifies_against_the_card_key() {
     let info = svc.openpgp_public_key(KeySlot::Sign).await.unwrap();
     let PublicKey::Rsa { modulus, exponent } = info.key else {
         println!(
-            "signature key is {}, not RSA; checked length only",
+            "signature key is {}, not RSA; checked the armor only",
             info.algorithm
         );
-        assert!(!signature.is_empty());
+        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----"));
         return;
     };
+    // Take the signature packet apart: creation time from the hashed
+    // subpackets, the RSA signature from the final MPI.
+    let packet = armored_packet(&armored);
+    let (hashed, signature) = signature_packet_parts(&packet);
+    let created_at = hashed
+        .windows(6)
+        .find(|w| w[..2] == [5, 2])
+        .map(|w| u32::from_be_bytes(w[2..6].try_into().unwrap()))
+        .expect("creation time subpacket");
+    let fingerprint: [u8; 20] = (0..40)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&info.fingerprint[i..i + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let key_info = openpgp::KeyInfo {
+        slot: KeySlot::Sign,
+        algorithm: openpgp::Algorithm::Rsa {
+            bits: (modulus.len() * 8) as u16,
+        },
+        fingerprint: Some(fingerprint),
+        created: None,
+    };
+    let builder = SignatureBuilder::new(
+        &key_info,
+        HashAlgorithm::Sha256,
+        Format::Detached,
+        created_at,
+    )
+    .unwrap();
+    let digest = builder.digest(&message::signed_data(Format::Detached, text));
     let key = rsa::RsaPublicKey::new(
         rsa::BigUint::from_bytes_be(&modulus),
         rsa::BigUint::from_bytes_be(&exponent),
     )
     .unwrap();
-    let digest_info = openpgp::signature_input(
-        &openpgp::Algorithm::Rsa { bits: 0 },
-        HashAlgorithm::Sha256,
-        &digest,
-    )
-    .unwrap();
+    // RustCrypto's own SHA-256 DigestInfo, independent of ours.
     key.verify(
-        rsa::Pkcs1v15Sign::new_unprefixed(),
-        &digest_info,
-        &signature,
+        rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+        &digest,
+        &left_pad(signature, modulus.len()),
     )
     .expect("card signature verifies with the card's public key");
+}
+
+/// The packet inside armor.
+fn armored_packet(armored: &str) -> Vec<u8> {
+    use base64::Engine;
+    let body: String = armored
+        .split("\n\n")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .take_while(|line| !line.starts_with('='))
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .unwrap()
+}
+
+/// A version 4 signature packet's hashed subpacket area and its RSA
+/// signature value (the one MPI): header, version/type/algorithms, hashed
+/// area, unhashed area, two digest bytes, then the MPI.
+fn signature_packet_parts(packet: &[u8]) -> (&[u8], &[u8]) {
+    let body = match packet[0] & 3 {
+        0 => &packet[2..],
+        1 => &packet[3..],
+        _ => &packet[5..],
+    };
+    let length_at = |at: usize| usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+    let hashed_len = length_at(4);
+    let hashed = &body[6..6 + hashed_len];
+    let unhashed_at = 6 + hashed_len;
+    let mpi_at = unhashed_at + 2 + length_at(unhashed_at) + 2;
+    let bits = length_at(mpi_at);
+    let value = &body[mpi_at + 2..mpi_at + 2 + bits.div_ceil(8)];
+    (hashed, value)
+}
+
+/// `value` with leading zeros put back, to `len` bytes.
+fn left_pad(value: &[u8], len: usize) -> Vec<u8> {
+    let mut out = vec![0; len - value.len()];
+    out.extend_from_slice(value);
+    out
 }

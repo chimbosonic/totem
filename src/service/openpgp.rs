@@ -16,8 +16,10 @@ use zeroize::Zeroizing;
 
 use super::{Service, ServiceError};
 use crate::card::{self, CardError, CardTransaction};
+use crate::openpgp::encrypted::{self, DataFormat, DecryptError};
+use crate::openpgp::message::{self, Format, SignatureBuilder};
 use crate::openpgp::proto::{
-    self, Algorithm, ApplicationData, Command, HashAlgorithm, InputError, Kdf, KeySlot, PgpError,
+    self, ApplicationData, Command, HashAlgorithm, InputError, Kdf, KeyInfo, KeySlot, PgpError,
     PublicKey, TouchPolicy,
 };
 
@@ -55,6 +57,28 @@ pub struct PinRetries {
     pub admin_pin: u8,
 }
 
+/// The session key of an encrypted message, recovered with the card.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessageSessionKey {
+    /// `algorithm:HEX`, for `gpg --override-session-key` and
+    /// `sq decrypt --session-key`. Wiped when dropped.
+    pub session_key: Zeroizing<String>,
+    pub cipher: &'static str,
+    /// The key ID the message names for this key.
+    pub key_id: String,
+    pub data_format: DataFormat,
+}
+
+impl std::fmt::Debug for MessageSessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageSessionKey")
+            .field("cipher", &self.cipher)
+            .field("key_id", &self.key_id)
+            .field("data_format", &self.data_format)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicKeyInfo {
     pub slot: KeySlot,
@@ -66,43 +90,53 @@ pub struct PublicKeyInfo {
 /// What a PIN-protected operation sends once the PIN is verified.
 #[derive(Clone, Copy)]
 enum Operation {
-    Sign(HashAlgorithm),
+    /// An OpenPGP signature over prepared signed bytes
+    /// ([`message::signed_data`]), made at Unix time `created`. The card
+    /// signs the signature packet's digest.
+    Message {
+        hash: HashAlgorithm,
+        format: Format,
+        created: u32,
+    },
+    /// PSO: DECIPHER of a message's encrypted session key.
     Decrypt,
-    Authenticate,
 }
 
 impl Operation {
     fn slot(self) -> KeySlot {
         match self {
-            Self::Sign(_) => KeySlot::Sign,
+            Self::Message { .. } => KeySlot::Sign,
             Self::Decrypt => KeySlot::Decrypt,
-            Self::Authenticate => KeySlot::Auth,
         }
     }
 
     fn command(self) -> Command {
         match self {
-            Self::Sign(_) => Command::Sign,
+            Self::Message { .. } => Command::Sign,
             Self::Decrypt => Command::Decipher,
-            Self::Authenticate => Command::Authenticate,
         }
     }
 
-    /// Card input for `data`, checked against the key's algorithm.
-    fn input(self, algorithm: &Algorithm, data: &[u8]) -> Result<Vec<u8>, InputError> {
+    /// Card input for `data`, checked against the key.
+    fn input(self, key: &KeyInfo, data: &[u8]) -> Result<Vec<u8>, InputError> {
+        let algorithm = &key.algorithm;
         match self {
-            Self::Sign(hash) => proto::signature_input(algorithm, hash, data),
+            Self::Message {
+                hash,
+                format,
+                created,
+            } => {
+                let digest = SignatureBuilder::new(key, hash, format, created)?.digest(data);
+                proto::signature_input(algorithm, hash, &digest)
+            }
             Self::Decrypt => proto::decipher_input(algorithm, data),
-            Self::Authenticate if data.is_empty() => Err(InputError::Empty),
-            Self::Authenticate => Ok(data.to_vec()),
         }
     }
 
     fn apdus(self, input: &[u8]) -> Vec<Vec<u8>> {
         match self {
-            Self::Sign(_) => proto::sign_apdus(input),
+            Self::Message { .. } => proto::sign_apdus(input),
             Self::Decrypt => proto::decipher_apdus(input),
-            Self::Authenticate => proto::authenticate_apdus(input),
         }
     }
 }
@@ -110,6 +144,10 @@ impl Operation {
 /// An operation's result, or why the service refused it without a card
 /// error. Kept apart from [`CardError`] so refusals are not retried.
 type Outcome<T> = Result<T, ServiceError>;
+
+/// What the card returned for a PIN-protected operation, wiped when
+/// dropped, and the key that produced it.
+type CardOutput = (Zeroizing<Vec<u8>>, KeyInfo);
 
 impl Service {
     /// Applet version, serial, keys, PIN retry counters, and signature count.
@@ -177,39 +215,70 @@ impl Service {
         .await?
     }
 
-    /// Sign `digest`, made with `hash`, with the signing key.
-    pub async fn openpgp_sign(
+    /// Sign `text` with the signing key as an OpenPGP message: a cleartext
+    /// signed message, or an armored detached signature over its exact
+    /// bytes. Timestamped with the service clock.
+    pub async fn openpgp_sign_message(
         &self,
         pin: Zeroizing<String>,
         hash: HashAlgorithm,
-        digest: Vec<u8>,
-    ) -> Result<Vec<u8>, ServiceError> {
-        self.with_pin(pin, Operation::Sign(hash), digest)
-            .await
-            .map(|out| out.to_vec())
+        format: Format,
+        text: String,
+    ) -> Result<String, ServiceError> {
+        if text.is_empty() {
+            return Err(ServiceError::BadInput(InputError::Empty));
+        }
+        let created = u32::try_from(self.clock.now()).unwrap_or(u32::MAX);
+        let data = message::signed_data(format, &text);
+        let operation = Operation::Message {
+            hash,
+            format,
+            created,
+        };
+        let (signature, key) = self.with_pin(pin, operation, data.clone()).await?;
+        // The same builder inputs as inside the transaction, so the same
+        // digest the card signed.
+        let builder =
+            SignatureBuilder::new(&key, hash, format, created).map_err(ServiceError::BadInput)?;
+        let packet = builder
+            .packet(&builder.digest(&data), &signature)
+            .map_err(ServiceError::OpenPgpProtocol)?;
+        Ok(message::render(format, &text, hash, &packet))
     }
 
-    /// Decrypt with the decryption key. For RSA keys `ciphertext` is the
-    /// RSA ciphertext; for ECDH keys it is the sender's ephemeral public
-    /// point. The result is the session key, wiped when dropped.
-    pub async fn openpgp_decrypt(
+    /// Recover the session key of an armored OpenPGP message encrypted to
+    /// the card's decryption key. The message is not decrypted; the
+    /// caller's gpg or sq does that with the session key.
+    pub async fn openpgp_decrypt_message(
         &self,
         pin: Zeroizing<String>,
-        ciphertext: Vec<u8>,
-    ) -> Result<Zeroizing<Vec<u8>>, ServiceError> {
-        self.with_pin(pin, Operation::Decrypt, ciphertext).await
-    }
-
-    /// Sign `data` as is with the authentication key (INTERNAL
-    /// AUTHENTICATE). For RSA keys the caller supplies the DigestInfo.
-    pub async fn openpgp_authenticate(
-        &self,
-        pin: Zeroizing<String>,
-        data: Vec<u8>,
-    ) -> Result<Vec<u8>, ServiceError> {
-        self.with_pin(pin, Operation::Authenticate, data)
-            .await
-            .map(|out| out.to_vec())
+        armored: &str,
+    ) -> Result<MessageSessionKey, ServiceError> {
+        // Everything that can fail without the PIN fails first.
+        let message = encrypted::dearmor(armored)
+            .and_then(|data| encrypted::parse_message(&data))
+            .map_err(ServiceError::Decrypt)?;
+        let key = self
+            .run(|tx| Ok(open(tx)?.key(KeySlot::Decrypt).clone()))
+            .await?;
+        if key.fingerprint.is_none() {
+            return Err(ServiceError::NoKey(KeySlot::Decrypt));
+        }
+        let pkesk = encrypted::select(&message, &key).map_err(ServiceError::Decrypt)?;
+        let input = encrypted::card_input(pkesk, &key).map_err(ServiceError::Decrypt)?;
+        let (output, used) = self.with_pin(pin, Operation::Decrypt, input).await?;
+        if used.fingerprint != key.fingerprint {
+            // The card changed between the two transactions.
+            return Err(ServiceError::Decrypt(DecryptError::Recovery));
+        }
+        let session =
+            encrypted::session_key(pkesk, &used, &output).map_err(ServiceError::Decrypt)?;
+        Ok(MessageSessionKey {
+            session_key: session.tool_form(),
+            cipher: session.cipher_name(),
+            key_id: pkesk.key_id.iter().map(|b| format!("{b:02X}")).collect(),
+            data_format: message.data_format,
+        })
     }
 
     async fn with_pin(
@@ -217,7 +286,7 @@ impl Service {
         pin: Zeroizing<String>,
         operation: Operation,
         data: Vec<u8>,
-    ) -> Result<Zeroizing<Vec<u8>>, ServiceError> {
+    ) -> Result<CardOutput, ServiceError> {
         let floor = self.pin_retry_floor;
         self.run(move |tx| run_with_pin(tx, floor, pin.as_bytes(), operation, &data))
             .await?
@@ -269,13 +338,15 @@ fn pw1_retries(tx: &mut dyn CardTransaction) -> Result<u8, CardError> {
     Ok(proto::parse_pw_status(&raw)?.pw1_retries)
 }
 
+/// Check everything that can fail without the PIN, then VERIFY and run
+/// `operation`. Returns the card output and the key that produced it.
 fn run_with_pin(
     tx: &mut dyn CardTransaction,
     floor: u8,
     pin: &[u8],
     operation: Operation,
     data: &[u8],
-) -> Result<Outcome<Zeroizing<Vec<u8>>>, CardError> {
+) -> Result<Outcome<CardOutput>, CardError> {
     let slot = operation.slot();
     let app = open(tx)?;
     let key = app.key(slot);
@@ -285,7 +356,7 @@ fn run_with_pin(
     if touch_policy(tx, slot)?.requires_touch() {
         return Ok(Err(ServiceError::TouchRequired(slot)));
     }
-    let input = match operation.input(&key.algorithm, data) {
+    let input = match operation.input(key, data) {
         Ok(input) => input,
         Err(e) => return Ok(Err(ServiceError::BadInput(e))),
     };
@@ -320,7 +391,7 @@ fn run_with_pin(
         Err(other) => return Err(other),
     }
     let output = card::send_openpgp(tx, &operation.apdus(&input), operation.command())?;
-    Ok(Ok(Zeroizing::new(output)))
+    Ok(Ok((Zeroizing::new(output), key.clone())))
 }
 
 #[cfg(test)]
@@ -329,11 +400,13 @@ mod tests {
     use crate::card::mock::openpgp::{MockKey, MockOpenPgp};
     use crate::card::mock::{MockCard, MockEvent, MockFault};
     use crate::clock::ManualClock;
+    use crate::openpgp::encrypted::fixtures;
     use crate::rng::SequentialChallengeSource;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use std::sync::Arc;
 
     const PIN: &str = "123456";
-    const DIGEST: [u8; 32] = [0x42; 32];
 
     fn card() -> MockCard {
         MockCard::new().with_password("oath").with_openpgp(
@@ -356,20 +429,23 @@ mod tests {
         Zeroizing::new(p.to_owned())
     }
 
+    /// Clearsign "hello": the PIN-protected path the API offers for signing.
+    async fn sign(service: &Service, pin_text: &str) -> Result<String, ServiceError> {
+        service
+            .openpgp_sign_message(
+                pin(pin_text),
+                HashAlgorithm::Sha256,
+                Format::Clearsign,
+                "hello".into(),
+            )
+            .await
+    }
+
     fn verifies(events: &[MockEvent]) -> usize {
         events
             .iter()
             .filter(|e| matches!(e, MockEvent::Apdu(a) if a[1] == 0x20))
             .count()
-    }
-
-    fn sha256_digest_info(digest: &[u8]) -> Vec<u8> {
-        proto::signature_input(
-            &Algorithm::Rsa { bits: 2048 },
-            HashAlgorithm::Sha256,
-            digest,
-        )
-        .unwrap()
     }
 
     #[tokio::test]
@@ -436,26 +512,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sign_with_right_pin_returns_the_card_signature() {
-        let card = card();
-        let signature = service(&card)
-            .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-            .await
-            .unwrap();
-        assert_eq!(
-            signature,
-            MockKey::rsa2048(b"sig").signature(&sha256_digest_info(&DIGEST))
-        );
-        assert_eq!(card.openpgp(MockOpenPgp::signature_counter), 1);
-    }
-
-    #[tokio::test]
     async fn wrong_pin_reports_retries_left() {
         let card = card();
         assert_eq!(
-            service(&card)
-                .openpgp_sign(pin("000000"), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
+            sign(&service(&card), "000000").await,
             Err(ServiceError::WrongPin { retries_left: 2 })
         );
     }
@@ -468,9 +528,7 @@ mod tests {
                 .with_key(KeySlot::Sign, MockKey::rsa2048(b"sig")),
         );
         assert_eq!(
-            service(&card)
-                .openpgp_sign(pin("000000"), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
+            sign(&service(&card), "000000").await,
             Err(ServiceError::WrongPin { retries_left: 2 })
         );
     }
@@ -479,7 +537,7 @@ mod tests {
     async fn the_floor_keeps_the_last_try() {
         let card = card();
         let service = service(&card);
-        let wrong = || service.openpgp_sign(pin("000000"), HashAlgorithm::Sha256, DIGEST.to_vec());
+        let wrong = || sign(&service, "000000");
         assert_eq!(
             wrong().await,
             Err(ServiceError::WrongPin { retries_left: 2 })
@@ -495,9 +553,7 @@ mod tests {
         );
         // Even the right PIN is not sent at the floor.
         assert_eq!(
-            service
-                .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
+            sign(&service, PIN).await,
             Err(ServiceError::PinRetryFloor { retries_left: 1 })
         );
         assert_eq!(verifies(&card.events()), 0);
@@ -510,16 +566,12 @@ mod tests {
         let service = service(&card).with_pin_retry_floor(0);
         for left in [2, 1, 0] {
             assert_eq!(
-                service
-                    .openpgp_sign(pin("000000"), HashAlgorithm::Sha256, DIGEST.to_vec())
-                    .await,
+                sign(&service, "000000").await,
                 Err(ServiceError::WrongPin { retries_left: left })
             );
         }
         assert_eq!(
-            service
-                .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
+            sign(&service, PIN).await,
             Err(ServiceError::PinRetryFloor { retries_left: 0 })
         );
     }
@@ -529,11 +581,11 @@ mod tests {
         let card = MockCard::new().with_openpgp(
             MockOpenPgp::new(PIN)
                 .with_pin_retries(0)
-                .with_key(KeySlot::Auth, MockKey::ed25519(b"a")),
+                .with_key(KeySlot::Sign, MockKey::ed25519(b"a")),
         );
         let service = service(&card).with_pin_retry_floor(0);
         assert_eq!(
-            service.openpgp_authenticate(pin(PIN), b"x".to_vec()).await,
+            sign(&service, PIN).await,
             Err(ServiceError::PinRetryFloor { retries_left: 0 })
         );
     }
@@ -542,14 +594,8 @@ mod tests {
     async fn right_pin_resets_the_counter() {
         let card = card();
         let service = service(&card);
-        service
-            .openpgp_sign(pin("000000"), HashAlgorithm::Sha256, DIGEST.to_vec())
-            .await
-            .unwrap_err();
-        service
-            .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-            .await
-            .unwrap();
+        sign(&service, "000000").await.unwrap_err();
+        sign(&service, PIN).await.unwrap();
         assert_eq!(card.openpgp(MockOpenPgp::pin_retries), 3);
     }
 
@@ -560,28 +606,18 @@ mod tests {
         let service = service(&card);
         assert_eq!(
             service
-                .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, vec![0; 20])
-                .await,
-            Err(ServiceError::BadInput(InputError::DigestLength))
-        );
-        assert_eq!(
-            service.openpgp_decrypt(pin(PIN), vec![1]).await,
-            Err(ServiceError::NoKey(KeySlot::Decrypt))
-        );
-        assert_eq!(
-            service
-                .openpgp_sign(pin("12345"), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
-            Err(ServiceError::BadPin)
-        );
-        assert_eq!(
-            service
-                .openpgp_sign(
-                    pin(&"1".repeat(128)),
+                .openpgp_sign_message(
+                    pin(PIN),
                     HashAlgorithm::Sha256,
-                    DIGEST.to_vec()
+                    Format::Clearsign,
+                    String::new()
                 )
                 .await,
+            Err(ServiceError::BadInput(InputError::Empty))
+        );
+        assert_eq!(sign(&service, "12345").await, Err(ServiceError::BadPin));
+        assert_eq!(
+            sign(&service, &"1".repeat(128)).await,
             Err(ServiceError::BadPin)
         );
         assert_eq!(verifies(&card.events()), 0);
@@ -589,64 +625,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decrypt_returns_the_session_key() {
-        let card = card();
-        let ciphertext = vec![0x5A; 256];
-        let plaintext = service(&card)
-            .openpgp_decrypt(pin(PIN), ciphertext.clone())
-            .await
-            .unwrap();
-        let mut input = vec![0x00];
-        input.extend_from_slice(&ciphertext);
-        assert_eq!(*plaintext, MockKey::rsa2048(b"dec").plaintext(&input));
-    }
-
-    #[tokio::test]
-    async fn decrypt_of_nothing_is_bad_input() {
-        let card = card();
-        assert_eq!(
-            service(&card).openpgp_decrypt(pin(PIN), Vec::new()).await,
-            Err(ServiceError::BadInput(InputError::Empty))
-        );
-    }
-
-    #[tokio::test]
-    async fn authenticate_signs_the_data_as_is() {
-        let card = card();
-        let service = service(&card);
-        assert_eq!(
-            service
-                .openpgp_authenticate(pin(PIN), b"challenge".to_vec())
-                .await,
-            Ok(MockKey::ed25519(b"aut").signature(b"challenge"))
-        );
-        assert_eq!(
-            service.openpgp_authenticate(pin(PIN), Vec::new()).await,
-            Err(ServiceError::BadInput(InputError::Empty))
-        );
-    }
-
-    #[tokio::test]
-    async fn ecdsa_sign_rejects_an_ecdh_only_key_type() {
-        let card = MockCard::new()
-            .with_openpgp(MockOpenPgp::new(PIN).with_key(KeySlot::Sign, MockKey::cv25519(b"x")));
-        assert_eq!(
-            service(&card)
-                .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
-            Err(ServiceError::BadInput(InputError::UnsupportedAlgorithm))
-        );
-    }
-
-    #[tokio::test]
     async fn sign_survives_one_card_reset_and_rechecks_the_floor() {
         let card = card();
         card.fail_next(1, MockFault::Reset);
-        let signature = service(&card)
-            .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-            .await
-            .unwrap();
-        assert_eq!(signature.len(), 256);
+        let armored = sign(&service(&card), PIN).await.unwrap();
+        assert!(armored.starts_with("-----BEGIN PGP SIGNED MESSAGE-----"));
         assert_eq!(
             card.events()
                 .iter()
@@ -683,10 +666,7 @@ mod tests {
         );
         let service = service(&card);
         assert!(service.openpgp_status().await.unwrap().kdf_enabled);
-        service
-            .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-            .await
-            .unwrap();
+        sign(&service, PIN).await.unwrap();
         assert_eq!(card.openpgp(MockOpenPgp::pin_retries), 3);
         let sent_hashed = card.events().iter().any(|e| {
             matches!(e, MockEvent::Apdu(a)
@@ -703,9 +683,7 @@ mod tests {
                 .with_key(KeySlot::Sign, MockKey::rsa2048(b"sig")),
         );
         assert_eq!(
-            service(&card)
-                .openpgp_sign(pin("000000"), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
+            sign(&service(&card), "000000").await,
             Err(ServiceError::WrongPin { retries_left: 2 })
         );
     }
@@ -721,9 +699,7 @@ mod tests {
                 .with_key(KeySlot::Sign, MockKey::rsa2048(b"sig")),
         );
         assert_eq!(
-            service(&card)
-                .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
+            sign(&service(&card), PIN).await,
             Err(ServiceError::KdfUnsupported)
         );
         assert_eq!(verifies(&card.events()), 0);
@@ -741,10 +717,7 @@ mod tests {
         let status = service.openpgp_status().await.unwrap();
         assert!(!status.kdf_enabled);
         assert!(status.keys.iter().all(|k| k.touch_policy == "off"));
-        service
-            .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-            .await
-            .unwrap();
+        sign(&service, PIN).await.unwrap();
         let asked_for_kdf = card
             .events()
             .iter()
@@ -757,7 +730,10 @@ mod tests {
         let card = MockCard::new().with_openpgp(
             MockOpenPgp::new(PIN)
                 .with_key(KeySlot::Sign, MockKey::rsa2048(b"sig"))
-                .with_key(KeySlot::Decrypt, MockKey::rsa2048(b"dec"))
+                .with_key(
+                    KeySlot::Decrypt,
+                    MockKey::rsa2048(b"dec").with_fingerprint(fixtures::RSA_FPR),
+                )
                 .with_key(KeySlot::Auth, MockKey::ed25519(b"aut"))
                 .with_touch(KeySlot::Sign, 0x03)
                 .with_touch(KeySlot::Decrypt, 0x01)
@@ -772,18 +748,14 @@ mod tests {
             .collect();
         assert_eq!(policies, ["cached", "on", "fixed"]);
         assert_eq!(
-            service
-                .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-                .await,
+            sign(&service, PIN).await,
             Err(ServiceError::TouchRequired(KeySlot::Sign))
         );
         assert_eq!(
-            service.openpgp_decrypt(pin(PIN), vec![1; 256]).await,
+            service
+                .openpgp_decrypt_message(pin(PIN), fixtures::RSA_SQ_MESSAGE)
+                .await,
             Err(ServiceError::TouchRequired(KeySlot::Decrypt))
-        );
-        assert_eq!(
-            service.openpgp_authenticate(pin(PIN), b"x".to_vec()).await,
-            Err(ServiceError::TouchRequired(KeySlot::Auth))
         );
         assert_eq!(verifies(&card.events()), 0);
         // Public keys never need a touch.
@@ -797,10 +769,270 @@ mod tests {
                 .with_key(KeySlot::Sign, MockKey::rsa2048(b"sig"))
                 .with_touch(KeySlot::Decrypt, 0x01),
         );
-        service(&card)
-            .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
+        sign(&service(&card), PIN).await.unwrap();
+    }
+
+    /// The packet inside an armored signature.
+    fn armored_packet(armored: &str) -> Vec<u8> {
+        let body: String = armored
+            .split("-----BEGIN PGP SIGNATURE-----\n\n")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .take_while(|line| !line.starts_with('='))
+            .collect();
+        BASE64.decode(body).unwrap()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn ed_sign_card() -> MockCard {
+        MockCard::new()
+            .with_openpgp(MockOpenPgp::new(PIN).with_key(KeySlot::Sign, MockKey::ed25519(b"sig")))
+    }
+
+    #[tokio::test]
+    async fn clearsigned_message_names_the_card_key_and_uses_the_service_clock() {
+        let card = card();
+        let service = Service::new(
+            Box::new(card.clone()),
+            Arc::new(ManualClock::new(1_700_000_000)),
+            Arc::new(SequentialChallengeSource::new(0)),
+        );
+        let armored = service
+            .openpgp_sign_message(
+                pin(PIN),
+                HashAlgorithm::Sha256,
+                Format::Clearsign,
+                "hello  \n".into(),
+            )
             .await
             .unwrap();
+        assert!(
+            armored.starts_with(
+                "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhello\n-----BEGIN PGP SIGNATURE-----\n"
+            ),
+            "{armored}"
+        );
+        assert!(armored.ends_with("-----END PGP SIGNATURE-----\n"));
+        let packet = armored_packet(&armored);
+        // Old-format signature packet, version 4, canonical text, RSA.
+        assert_eq!(packet[3..6], [4, 0x01, 1]);
+        let fingerprint = MockKey::rsa2048(b"sig").fingerprint();
+        let created = 1_700_000_000u32.to_be_bytes();
+        assert!(contains(
+            &packet,
+            &[&[22, 33, 4][..], &fingerprint].concat()
+        ));
+        assert!(contains(&packet, &[&[5, 2][..], &created].concat()));
+        assert_eq!(card.openpgp(MockOpenPgp::signature_counter), 1);
+        assert_eq!(card.openpgp(MockOpenPgp::pin_retries), 3);
+    }
+
+    #[tokio::test]
+    async fn detached_signature_is_armored() {
+        let card = ed_sign_card();
+        let armored = service(&card)
+            .openpgp_sign_message(
+                pin(PIN),
+                HashAlgorithm::Sha512,
+                Format::Detached,
+                "data".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            armored.starts_with("-----BEGIN PGP SIGNATURE-----\n\n"),
+            "{armored}"
+        );
+        let packet = armored_packet(&armored);
+        // Binary document signature, EdDSA, SHA-512.
+        assert_eq!(packet[2..6], [4, 0x00, 22, 10]);
+    }
+
+    #[tokio::test]
+    async fn message_requests_that_cannot_work_never_send_the_pin() {
+        let empty = card();
+        assert_eq!(
+            service(&empty)
+                .openpgp_sign_message(
+                    pin(PIN),
+                    HashAlgorithm::Sha256,
+                    Format::Clearsign,
+                    String::new()
+                )
+                .await,
+            Err(ServiceError::BadInput(InputError::Empty))
+        );
+        assert_eq!(verifies(&empty.events()), 0);
+
+        let ecdh = MockCard::new()
+            .with_openpgp(MockOpenPgp::new(PIN).with_key(KeySlot::Sign, MockKey::cv25519(b"x")));
+        assert_eq!(
+            service(&ecdh)
+                .openpgp_sign_message(
+                    pin(PIN),
+                    HashAlgorithm::Sha256,
+                    Format::Clearsign,
+                    "x".into()
+                )
+                .await,
+            Err(ServiceError::BadInput(InputError::UnsupportedAlgorithm))
+        );
+        assert_eq!(verifies(&ecdh.events()), 0);
+
+        let touch = MockCard::new().with_openpgp(
+            MockOpenPgp::new(PIN)
+                .with_key(KeySlot::Sign, MockKey::rsa2048(b"sig"))
+                .with_touch(KeySlot::Sign, 0x01),
+        );
+        assert_eq!(
+            service(&touch)
+                .openpgp_sign_message(
+                    pin(PIN),
+                    HashAlgorithm::Sha256,
+                    Format::Clearsign,
+                    "x".into()
+                )
+                .await,
+            Err(ServiceError::TouchRequired(KeySlot::Sign))
+        );
+        assert_eq!(verifies(&touch.events()), 0);
+    }
+
+    #[tokio::test]
+    async fn message_with_a_wrong_pin_reports_retries() {
+        let card = ed_sign_card();
+        assert_eq!(
+            service(&card)
+                .openpgp_sign_message(
+                    pin("000000"),
+                    HashAlgorithm::Sha256,
+                    Format::Clearsign,
+                    "x".into()
+                )
+                .await,
+            Err(ServiceError::WrongPin { retries_left: 2 })
+        );
+    }
+
+    fn decrypt_card(key: MockKey) -> MockCard {
+        MockCard::new().with_openpgp(MockOpenPgp::new(PIN).with_key(KeySlot::Decrypt, key))
+    }
+
+    fn rsa_fixture_key() -> MockKey {
+        MockKey::rsa2048(b"dec")
+            .with_fingerprint(fixtures::RSA_FPR)
+            .with_decipher_output(&fixtures::RSA_SQ_CARD_OUTPUT)
+    }
+
+    #[tokio::test]
+    async fn rsa_message_session_key_is_recovered() {
+        let card = decrypt_card(rsa_fixture_key());
+        let result = service(&card)
+            .openpgp_decrypt_message(pin(PIN), fixtures::RSA_SQ_MESSAGE)
+            .await
+            .unwrap();
+        assert_eq!(result.session_key.as_str(), fixtures::RSA_SQ_SESSION_KEY);
+        assert_eq!(result.cipher, "aes256");
+        assert_eq!(result.key_id, "B407021995AE2021");
+        assert_eq!(result.data_format, DataFormat::SeipdV1);
+        assert!(!format!("{result:?}").contains(&fixtures::RSA_SQ_SESSION_KEY[2..10]));
+        // The card got 0x00 and the 256-byte ciphertext, command chained.
+        let decipher: Vec<_> = card
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                MockEvent::Apdu(a) if a[1..4] == [0x2A, 0x80, 0x86] => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decipher.len(), 2);
+        assert_eq!(decipher[0][0], 0x10, "first part is chained");
+        assert_eq!(decipher[0][5], 0x00, "padding indicator");
+    }
+
+    #[tokio::test]
+    async fn curve25519_message_session_key_is_recovered() {
+        let card = decrypt_card(
+            MockKey::cv25519(b"dec")
+                .with_fingerprint(fixtures::CV_FPR)
+                .with_decipher_output(&fixtures::CV_SQ_CARD_OUTPUT),
+        );
+        let result = service(&card)
+            .openpgp_decrypt_message(pin(PIN), fixtures::CV_SQ_MESSAGE)
+            .await
+            .unwrap();
+        assert_eq!(result.session_key.as_str(), fixtures::CV_SQ_SESSION_KEY);
+        assert_eq!(result.key_id, "0F704F4E8FE94366");
+    }
+
+    #[tokio::test]
+    async fn message_problems_never_reach_the_pin() {
+        let card = decrypt_card(rsa_fixture_key());
+        let first = service(&card);
+        assert_eq!(
+            first
+                .openpgp_decrypt_message(pin(PIN), "not a message")
+                .await,
+            Err(ServiceError::Decrypt(DecryptError::NotArmored))
+        );
+        assert!(card.events().is_empty(), "bad input never reaches the card");
+        let other = decrypt_card(MockKey::rsa2048(b"other"));
+        assert!(matches!(
+            service(&other)
+                .openpgp_decrypt_message(pin(PIN), fixtures::RSA_SQ_MESSAGE)
+                .await,
+            Err(ServiceError::Decrypt(DecryptError::NotForThisKey { .. }))
+        ));
+        assert_eq!(verifies(&other.events()), 0);
+        let none = MockCard::new().with_openpgp(MockOpenPgp::new(PIN));
+        assert_eq!(
+            service(&none)
+                .openpgp_decrypt_message(pin(PIN), fixtures::RSA_SQ_MESSAGE)
+                .await,
+            Err(ServiceError::NoKey(KeySlot::Decrypt))
+        );
+        let touch = MockCard::new().with_openpgp(
+            MockOpenPgp::new(PIN)
+                .with_key(KeySlot::Decrypt, rsa_fixture_key())
+                .with_touch(KeySlot::Decrypt, 0x03),
+        );
+        assert_eq!(
+            service(&touch)
+                .openpgp_decrypt_message(pin(PIN), fixtures::RSA_SQ_MESSAGE)
+                .await,
+            Err(ServiceError::TouchRequired(KeySlot::Decrypt))
+        );
+        assert_eq!(verifies(&touch.events()), 0);
+    }
+
+    #[tokio::test]
+    async fn message_decrypt_counts_a_wrong_pin() {
+        let card = decrypt_card(rsa_fixture_key());
+        assert_eq!(
+            service(&card)
+                .openpgp_decrypt_message(pin("000000"), fixtures::RSA_SQ_MESSAGE)
+                .await,
+            Err(ServiceError::WrongPin { retries_left: 2 })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_answer_that_is_not_the_session_key_is_refused() {
+        let card = decrypt_card(
+            MockKey::rsa2048(b"dec")
+                .with_fingerprint(fixtures::RSA_FPR)
+                .with_decipher_output(&[9; 35]),
+        );
+        assert_eq!(
+            service(&card)
+                .openpgp_decrypt_message(pin(PIN), fixtures::RSA_SQ_MESSAGE)
+                .await,
+            Err(ServiceError::Decrypt(DecryptError::Recovery))
+        );
     }
 
     #[tokio::test]
@@ -809,9 +1041,6 @@ mod tests {
         let service = service(&card);
         service.openpgp_status().await.unwrap();
         service.startup_check().await.unwrap();
-        service
-            .openpgp_sign(pin(PIN), HashAlgorithm::Sha256, DIGEST.to_vec())
-            .await
-            .unwrap();
+        sign(&service, PIN).await.unwrap();
     }
 }

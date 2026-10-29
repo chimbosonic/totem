@@ -15,11 +15,14 @@ use crate::card::{self, Card, CardError, CardTransaction};
 use crate::clock::Clock;
 use crate::oath::crypto::{self, DerivedKey};
 use crate::oath::proto::{self, Command, EntryState, ProtoError, SelectResponse};
+use crate::openpgp::encrypted::DecryptError;
 use crate::openpgp::proto::{InputError, KeySlot, PgpError};
 use crate::rng::ChallengeSource;
 use crate::session::AuthedSession;
 
-pub use openpgp::{DEFAULT_PIN_RETRY_FLOOR, KeyStatus, OpenPgpStatus, PinRetries, PublicKeyInfo};
+pub use openpgp::{
+    DEFAULT_PIN_RETRY_FLOOR, KeyStatus, MessageSessionKey, OpenPgpStatus, PinRetries, PublicKeyInfo,
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ServiceError {
@@ -52,6 +55,10 @@ pub enum ServiceError {
     TouchRequired(KeySlot),
     #[error("the card's PIN KDF is not supported")]
     KdfUnsupported,
+    /// An encrypted message could not be used, or its session key could
+    /// not be recovered.
+    #[error("{0}")]
+    Decrypt(DecryptError),
     #[error("bad input: {0}")]
     BadInput(InputError),
     #[error("OpenPGP protocol error: {0}")]

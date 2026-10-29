@@ -7,6 +7,7 @@ use dropshot::{ClientErrorStatusCode, ErrorStatusCode, HttpError};
 use http::HeaderValue;
 use http::header::RETRY_AFTER;
 
+use crate::openpgp::encrypted::DecryptError;
 use crate::ratelimit::Denied;
 use crate::service::ServiceError;
 
@@ -61,6 +62,28 @@ impl From<ServiceError> for HttpError {
                 internal_message: error.to_string(),
                 headers: None,
             },
+            ServiceError::Decrypt(e) => {
+                let (status, code) = match e {
+                    DecryptError::NotArmored
+                    | DecryptError::BadChecksum
+                    | DecryptError::Malformed(_)
+                    | DecryptError::NoSessionKey => {
+                        (ClientErrorStatusCode::BAD_REQUEST, "BadMessage")
+                    }
+                    DecryptError::NotForThisKey { .. } => {
+                        (ClientErrorStatusCode::UNPROCESSABLE_ENTITY, "NotForThisKey")
+                    }
+                    DecryptError::Unsupported(_) => (
+                        ClientErrorStatusCode::UNPROCESSABLE_ENTITY,
+                        "UnsupportedMessage",
+                    ),
+                    DecryptError::Recovery => (
+                        ClientErrorStatusCode::UNPROCESSABLE_ENTITY,
+                        "SessionKeyRecoveryFailed",
+                    ),
+                };
+                client_error(status, code, &e.to_string())
+            }
             ServiceError::BadInput(e) => client_error(
                 ClientErrorStatusCode::BAD_REQUEST,
                 "BadInput",
@@ -153,6 +176,19 @@ mod tests {
             (ServiceError::BadPin, 400),
             (ServiceError::TouchRequired(KeySlot::Sign), 409),
             (ServiceError::KdfUnsupported, 501),
+            (ServiceError::Decrypt(DecryptError::NotArmored), 400),
+            (ServiceError::Decrypt(DecryptError::BadChecksum), 400),
+            (ServiceError::Decrypt(DecryptError::Malformed("x")), 400),
+            (ServiceError::Decrypt(DecryptError::NoSessionKey), 400),
+            (
+                ServiceError::Decrypt(DecryptError::NotForThisKey {
+                    message: "A".into(),
+                    card: "B".into(),
+                }),
+                422,
+            ),
+            (ServiceError::Decrypt(DecryptError::Unsupported("x")), 422),
+            (ServiceError::Decrypt(DecryptError::Recovery), 422),
             (ServiceError::BadInput(InputError::DigestLength), 400),
             (ServiceError::OpenPgpProtocol(PgpError::Status(0x6F00)), 503),
         ];
@@ -172,6 +208,7 @@ mod tests {
                 | ServiceError::BadPin
                 | ServiceError::TouchRequired(_)
                 | ServiceError::KdfUnsupported
+                | ServiceError::Decrypt(_)
                 | ServiceError::BadInput(_)
                 | ServiceError::OpenPgpProtocol(_) => {}
             }

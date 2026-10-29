@@ -33,6 +33,11 @@ const INS_PSO: u8 = 0x2A;
 const INS_INTERNAL_AUTHENTICATE: u8 = 0x88;
 const INS_READ_PUBLIC_KEY: u8 = 0x47;
 
+const ED25519_POINT: [u8; 32] = [
+    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+];
+
 /// Retries PW1 starts with, as on a fresh card.
 pub const DEFAULT_PIN_RETRIES: u8 = 3;
 const PW1_MAX_LEN: u8 = 127;
@@ -56,6 +61,8 @@ pub struct MockKey {
     kind: MockKeyKind,
     seed: Vec<u8>,
     pub created: u32,
+    fingerprint: Option<[u8; 20]>,
+    decipher_output: Option<Vec<u8>>,
 }
 
 impl MockKey {
@@ -64,7 +71,23 @@ impl MockKey {
             kind: MockKeyKind::Rsa2048,
             seed: seed.to_vec(),
             created: 1_600_000_000,
+            fingerprint: None,
+            decipher_output: None,
         }
+    }
+
+    /// Use `fingerprint` instead of one derived from the seed, for example
+    /// to match a recorded test message.
+    pub fn with_fingerprint(mut self, fingerprint: [u8; 20]) -> Self {
+        self.fingerprint = Some(fingerprint);
+        self
+    }
+
+    /// Answer PSO: DECIPHER with `output`, as a real key would for one
+    /// recorded message.
+    pub fn with_decipher_output(mut self, output: &[u8]) -> Self {
+        self.decipher_output = Some(output.to_vec());
+        self
     }
 
     pub fn ed25519(seed: &[u8]) -> Self {
@@ -90,6 +113,9 @@ impl MockKey {
     }
 
     pub fn fingerprint(&self) -> [u8; 20] {
+        if let Some(fingerprint) = self.fingerprint {
+            return fingerprint;
+        }
         let digest = Sha256::new()
             .chain_update(b"fingerprint")
             .chain_update(&self.seed)
@@ -116,10 +142,20 @@ impl MockKey {
     }
 
     /// RSA modulus or EC point.
+    /// RSA modulus or EC point. Each is a well-formed public key (an odd
+    /// 2048-bit modulus, a valid Ed25519 point) so OpenPGP libraries accept
+    /// it, though nothing here has its private key.
     pub fn public_value(&self) -> Vec<u8> {
         match self.kind {
-            MockKeyKind::Rsa2048 => self.stretch(b"modulus", &[], 256),
-            MockKeyKind::Ed25519 | MockKeyKind::Cv25519 => {
+            MockKeyKind::Rsa2048 => {
+                let mut modulus = self.stretch(b"modulus", &[], 256);
+                modulus[0] |= 0x80;
+                modulus[255] |= 0x01;
+                modulus
+            }
+            // The public key from RFC 8032 section 7.1, test 1.
+            MockKeyKind::Ed25519 => [&[0x40][..], &ED25519_POINT].concat(),
+            MockKeyKind::Cv25519 => {
                 let mut point = vec![0x40];
                 point.extend(self.stretch(b"point", &[], 32));
                 point
@@ -412,7 +448,10 @@ impl MockOpenPgp {
         if !well_formed {
             return Err(SW_WRONG_DATA);
         }
-        Ok(key.plaintext(input))
+        Ok(key
+            .decipher_output
+            .clone()
+            .unwrap_or_else(|| key.plaintext(input)))
     }
 
     fn authenticate(&mut self, input: &[u8]) -> Result<Vec<u8>, u16> {

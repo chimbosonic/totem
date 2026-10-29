@@ -3,12 +3,10 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use dropshot::{
-    ApiDescription, Body, ClientErrorStatusCode, ConfigDropshot, HandlerTaskMode, HttpError,
-    HttpResponseHeaders, HttpResponseOk, HttpResponseUpdatedNoContent, HttpServer, Path,
-    RequestContext, ServerBuilder, TypedBody,
+    ApiDescription, Body, ConfigDropshot, HandlerTaskMode, HttpError, HttpResponseHeaders,
+    HttpResponseOk, HttpResponseUpdatedNoContent, HttpServer, Path, RequestContext, ServerBuilder,
+    TypedBody,
 };
 use http::header::{CONTENT_TYPE, SET_COOKIE};
 use http::{HeaderValue, Response, StatusCode};
@@ -23,9 +21,9 @@ use super::security::{RespKind, require_json, secure_result};
 use crate::service::ServiceError;
 
 use super::definition::{
-    AuthenticateRequest, CodesResponse, DecryptRequest, DecryptResponse, HealthResponse,
-    KeySlotPath, NoContent, OathApi, OpenPgpStatusResponse, PublicKeyResponse, SignRequest,
-    SignatureResponse, UnlockRequest, oath_api_mod,
+    CodesResponse, DecryptMessageRequest, DecryptMessageResponse, HealthResponse, KeySlotPath,
+    NoContent, OathApi, OpenPgpStatusResponse, PublicKeyResponse, SignMessageRequest,
+    SignMessageResponse, UnlockRequest, oath_api_mod,
 };
 use crate::config::Config;
 use crate::openpgp::proto::{self as pgp, KeySlot};
@@ -90,25 +88,18 @@ impl OathApi for OathApiImpl {
         secure_result(openpgp_public_key(&rqctx, slot).await, RespKind::Api)
     }
 
-    async fn openpgp_sign(
+    async fn openpgp_sign_message(
         rqctx: RequestContext<ApiContext>,
-        body: TypedBody<SignRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseOk<SignatureResponse>>, HttpError> {
-        secure_result(openpgp_sign(&rqctx, body).await, RespKind::Api)
+        body: TypedBody<SignMessageRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<SignMessageResponse>>, HttpError> {
+        secure_result(openpgp_sign_message(&rqctx, body).await, RespKind::Api)
     }
 
-    async fn openpgp_decrypt(
+    async fn openpgp_decrypt_message(
         rqctx: RequestContext<ApiContext>,
-        body: TypedBody<DecryptRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseOk<DecryptResponse>>, HttpError> {
-        secure_result(openpgp_decrypt(&rqctx, body).await, RespKind::Api)
-    }
-
-    async fn openpgp_authenticate(
-        rqctx: RequestContext<ApiContext>,
-        body: TypedBody<AuthenticateRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseOk<SignatureResponse>>, HttpError> {
-        secure_result(openpgp_authenticate(&rqctx, body).await, RespKind::Api)
+        body: TypedBody<DecryptMessageRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<DecryptMessageResponse>>, HttpError> {
+        secure_result(openpgp_decrypt_message(&rqctx, body).await, RespKind::Api)
     }
 
     async fn healthz(
@@ -300,17 +291,6 @@ async fn openpgp_public_key(
     Ok(ok(info.into()))
 }
 
-/// Decode a base64 request field, or a 400 naming it.
-fn base64_field(name: &str, value: &str) -> Result<Vec<u8>, HttpError> {
-    BASE64.decode(value).map_err(|_| {
-        HttpError::for_client_error(
-            Some("BadInput".into()),
-            ClientErrorStatusCode::BAD_REQUEST,
-            format!("{name} is not valid base64"),
-        )
-    })
-}
-
 /// Run a PIN-protected OpenPGP operation under the PIN rate limit, and
 /// write its audit events. `event` names the operation in the log.
 async fn with_pin<T>(
@@ -371,62 +351,55 @@ async fn with_pin<T>(
     }
 }
 
-async fn openpgp_sign(
+async fn openpgp_sign_message(
     rqctx: &RequestContext<ApiContext>,
-    body: TypedBody<SignRequest>,
-) -> Result<Ok200<SignatureResponse>, HttpError> {
+    body: TypedBody<SignMessageRequest>,
+) -> Result<Ok200<SignMessageResponse>, HttpError> {
     require_json(rqctx.request.headers())?;
     let request = body.into_inner();
     let pin = Zeroizing::new(request.pin);
-    let digest = base64_field("digest", &request.digest)?;
+    let input = request.text.as_bytes().to_vec();
     let service = &rqctx.context().service;
-    let operation = service.openpgp_sign(pin, request.hash.into(), digest.clone());
-    let signature = with_pin(rqctx, "openpgp_sign", KeySlot::Sign, &digest, operation).await?;
-    Ok(ok(signature.into()))
+    let operation = service.openpgp_sign_message(
+        pin,
+        request.hash.into(),
+        request.format.into(),
+        request.text,
+    );
+    let armored = with_pin(
+        rqctx,
+        "openpgp_sign_message",
+        KeySlot::Sign,
+        &input,
+        operation,
+    )
+    .await?;
+    Ok(ok(SignMessageResponse { armored }))
 }
 
-async fn openpgp_decrypt(
+async fn openpgp_decrypt_message(
     rqctx: &RequestContext<ApiContext>,
-    body: TypedBody<DecryptRequest>,
-) -> Result<Ok200<DecryptResponse>, HttpError> {
+    body: TypedBody<DecryptMessageRequest>,
+) -> Result<Ok200<DecryptMessageResponse>, HttpError> {
     require_json(rqctx.request.headers())?;
     let request = body.into_inner();
     let pin = Zeroizing::new(request.pin);
-    let ciphertext = base64_field("ciphertext", &request.ciphertext)?;
     let service = &rqctx.context().service;
-    let operation = service.openpgp_decrypt(pin, ciphertext.clone());
-    let plaintext = with_pin(
+    let operation = service.openpgp_decrypt_message(pin, &request.message);
+    let recovered = with_pin(
         rqctx,
-        "openpgp_decrypt",
+        "openpgp_decrypt_message",
         KeySlot::Decrypt,
-        &ciphertext,
+        request.message.as_bytes(),
         operation,
     )
     .await?;
-    Ok(ok(DecryptResponse {
-        plaintext: BASE64.encode(plaintext.as_slice()),
+    Ok(ok(DecryptMessageResponse {
+        session_key: recovered.session_key.to_string(),
+        cipher: recovered.cipher.to_owned(),
+        key_id: recovered.key_id.clone(),
+        data_format: recovered.data_format.into(),
     }))
-}
-
-async fn openpgp_authenticate(
-    rqctx: &RequestContext<ApiContext>,
-    body: TypedBody<AuthenticateRequest>,
-) -> Result<Ok200<SignatureResponse>, HttpError> {
-    require_json(rqctx.request.headers())?;
-    let request = body.into_inner();
-    let pin = Zeroizing::new(request.pin);
-    let data = base64_field("data", &request.data)?;
-    let service = &rqctx.context().service;
-    let operation = service.openpgp_authenticate(pin, data.clone());
-    let signature = with_pin(
-        rqctx,
-        "openpgp_authenticate",
-        KeySlot::Auth,
-        &data,
-        operation,
-    )
-    .await?;
-    Ok(ok(signature.into()))
 }
 
 /// Log a card problem as an audit event and turn it into the HTTP error.
@@ -510,6 +483,8 @@ mod tests {
     use crate::logging::test_support::SharedBuf;
     use crate::oath::crypto::{self, Algorithm};
     use crate::rng::SequentialChallengeSource;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use reqwest::StatusCode;
     use serde_json::{Value, json};
 
@@ -561,7 +536,6 @@ mod tests {
     }
 
     const PIN: &str = "pin-123456";
-    const DIGEST: [u8; 32] = [0x42; 32];
 
     fn base_config() -> Config {
         Config::from_lookup(|_| None).unwrap()
@@ -665,11 +639,12 @@ mod tests {
             request.send().await.unwrap()
         }
 
+        /// Clearsign "hello": the PIN-protected path the tests exercise.
         async fn sign(&self, cookie: &str, pin: &str) -> reqwest::Response {
             self.post(
-                "/api/openpgp/sign",
+                "/api/openpgp/sign-message",
                 Some(cookie),
-                json!({ "pin": pin, "hash": "sha256", "digest": BASE64.encode(DIGEST) }),
+                json!({ "pin": pin, "hash": "sha256", "format": "clearsign", "text": "hello" }),
             )
             .await
         }
@@ -1198,6 +1173,9 @@ mod tests {
                 "digest": "",
                 "ciphertext": "",
                 "data": "",
+                "format": "clearsign",
+                "text": "",
+                "message": "",
             });
             let response = h
                 .client
@@ -1212,7 +1190,7 @@ mod tests {
             assert_security_headers(&response, api_path);
             seen += 1;
         }
-        assert_eq!(seen, 15);
+        assert_eq!(seen, 14);
         h.shutdown().await;
     }
 
@@ -1275,15 +1253,6 @@ mod tests {
             .count()
     }
 
-    fn rsa_sha256_signature_input(digest: &[u8]) -> Vec<u8> {
-        pgp::signature_input(
-            &pgp::Algorithm::Rsa { bits: 2048 },
-            pgp::HashAlgorithm::Sha256,
-            digest,
-        )
-        .unwrap()
-    }
-
     #[tokio::test]
     async fn openpgp_endpoints_need_a_session() {
         let h = harness().await;
@@ -1295,14 +1264,19 @@ mod tests {
             h.get("/api/openpgp/keys/sign", None).await.status(),
             StatusCode::UNAUTHORIZED
         );
-        let response = h
-            .post(
-                "/api/openpgp/sign",
-                None,
-                json!({ "pin": PIN, "hash": "sha256", "digest": BASE64.encode(DIGEST) }),
-            )
-            .await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for (path, body) in [
+            (
+                "/api/openpgp/sign-message",
+                json!({ "pin": PIN, "hash": "sha256", "format": "clearsign", "text": "x" }),
+            ),
+            (
+                "/api/openpgp/decrypt-message",
+                json!({ "pin": PIN, "message": "x" }),
+            ),
+        ] {
+            let response = h.post(path, None, body).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
         assert_eq!(verifies(&h.card), 0);
         h.shutdown().await;
     }
@@ -1361,51 +1335,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openpgp_sign_returns_the_card_signature() {
+    async fn openpgp_messages_are_clearsigned_or_detached() {
         let h = harness().await;
         let cookie = h.login().await;
-        let response = h.sign(&cookie, PIN).await;
+        // Longer than the global 1 KiB body limit.
+        let text = "a line of text\n".repeat(400);
+        let response = h
+            .post(
+                "/api/openpgp/sign-message",
+                Some(&cookie),
+                json!({ "pin": PIN, "hash": "sha256", "format": "clearsign", "text": text }),
+            )
+            .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_security_headers(&response, true);
-        let body = response.json_value().await;
-        let expected = MockKey::rsa2048(b"sig").signature(&rsa_sha256_signature_input(&DIGEST));
-        assert_eq!(body["signature"], BASE64.encode(expected));
-        h.shutdown().await;
+        let armored = response.json_value().await["armored"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(armored.starts_with("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"));
+        assert!(armored.contains("a line of text\n"));
+
+        let response = h
+            .post(
+                "/api/openpgp/sign-message",
+                Some(&cookie),
+                json!({ "pin": PIN, "hash": "sha512", "format": "detached", "text": "data" }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let armored = response.json_value().await["armored"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----\n"));
+
+        let response = h
+            .post(
+                "/api/openpgp/sign-message",
+                Some(&cookie),
+                json!({ "pin": PIN, "hash": "sha256", "format": "clearsign", "text": "" }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(h.card.openpgp(MockOpenPgp::signature_counter), 2);
+        let logs = h.shutdown().await;
+        assert!(logs.contains("\"event\":\"openpgp_sign_message\""));
+        assert!(!logs.contains("a line of text"), "the text is never logged");
+        assert!(!logs.contains(PIN));
     }
 
     #[tokio::test]
-    async fn openpgp_decrypt_and_authenticate_work() {
-        let h = harness().await;
+    async fn encrypted_message_session_key_is_recovered() {
+        use crate::openpgp::encrypted::fixtures;
+        let card = MockCard::new().with_password(PASSWORD).with_openpgp(
+            MockOpenPgp::new(PIN).with_key(
+                pgp::KeySlot::Decrypt,
+                MockKey::rsa2048(b"dec")
+                    .with_fingerprint(fixtures::RSA_FPR)
+                    .with_decipher_output(&fixtures::RSA_SQ_CARD_OUTPUT),
+            ),
+        );
+        let h = harness_with(card, base_config()).await;
         let cookie = h.login().await;
-        // Bigger than the global 1 KiB body limit, within the OpenPGP one.
-        let ciphertext = vec![0x5A; 900];
         let response = h
             .post(
-                "/api/openpgp/decrypt",
+                "/api/openpgp/decrypt-message",
                 Some(&cookie),
-                json!({ "pin": PIN, "ciphertext": BASE64.encode(&ciphertext) }),
+                json!({ "pin": PIN, "message": fixtures::RSA_SQ_MESSAGE }),
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let mut input = vec![0x00];
-        input.extend_from_slice(&ciphertext);
-        assert_eq!(
-            response.json_value().await["plaintext"],
-            BASE64.encode(MockKey::rsa2048(b"dec").plaintext(&input))
-        );
+        assert_security_headers(&response, true);
+        let body = response.json_value().await;
+        assert_eq!(body["session_key"], fixtures::RSA_SQ_SESSION_KEY);
+        assert_eq!(body["cipher"], "aes256");
+        assert_eq!(body["key_id"], "B407021995AE2021");
+        assert_eq!(body["data_format"], "seipd_v1");
 
         let response = h
             .post(
-                "/api/openpgp/authenticate",
+                "/api/openpgp/decrypt-message",
                 Some(&cookie),
-                json!({ "pin": PIN, "data": BASE64.encode(b"challenge") }),
+                json!({ "pin": PIN, "message": "hello" }),
             )
             .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.json_value().await["signature"],
-            BASE64.encode(MockKey::ed25519(b"aut").signature(b"challenge"))
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(&response.json_value().await), "BadMessage");
+        let logs = h.shutdown().await;
+        assert!(logs.contains("\"event\":\"openpgp_decrypt_message\""));
+        assert!(!logs.contains(&fixtures::RSA_SQ_SESSION_KEY[2..]));
+        assert!(!logs.contains(PIN));
+    }
+
+    #[tokio::test]
+    async fn message_for_another_key_is_422_with_both_key_ids() {
+        use crate::openpgp::encrypted::fixtures;
+        let h = harness().await;
+        let cookie = h.login().await;
+        let response = h
+            .post(
+                "/api/openpgp/decrypt-message",
+                Some(&cookie),
+                json!({ "pin": PIN, "message": fixtures::RSA_SQ_MESSAGE }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response.json_value().await;
+        assert_eq!(error_code(&body), "NotForThisKey");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("B407021995AE2021")
         );
+        assert_eq!(verifies(&h.card), 0);
         h.shutdown().await;
     }
 
@@ -1413,11 +1457,12 @@ mod tests {
     async fn openpgp_body_over_the_limit_is_rejected() {
         let h = harness().await;
         let cookie = h.login().await;
+        // Over the 64 KiB limit for messages to sign.
         let response = h
             .post(
-                "/api/openpgp/decrypt",
+                "/api/openpgp/sign-message",
                 Some(&cookie),
-                json!({ "pin": PIN, "ciphertext": "A".repeat(5000) }),
+                json!({ "pin": PIN, "hash": "sha256", "format": "clearsign", "text": "A".repeat(70_000) }),
             )
             .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1475,24 +1520,19 @@ mod tests {
         let cookie = h.login().await;
         for (path, body, code) in [
             (
-                "/api/openpgp/sign",
-                json!({ "pin": PIN, "hash": "sha256", "digest": "not base64!" }),
+                "/api/openpgp/sign-message",
+                json!({ "pin": PIN, "hash": "sha256", "format": "clearsign", "text": "" }),
                 "BadInput",
             ),
             (
-                "/api/openpgp/sign",
-                json!({ "pin": PIN, "hash": "sha512", "digest": BASE64.encode(DIGEST) }),
-                "BadInput",
-            ),
-            (
-                "/api/openpgp/sign",
-                json!({ "pin": "123", "hash": "sha256", "digest": BASE64.encode(DIGEST) }),
+                "/api/openpgp/sign-message",
+                json!({ "pin": "123", "hash": "sha256", "format": "clearsign", "text": "x" }),
                 "BadPin",
             ),
             (
-                "/api/openpgp/decrypt",
-                json!({ "pin": PIN, "ciphertext": "" }),
-                "BadInput",
+                "/api/openpgp/decrypt-message",
+                json!({ "pin": PIN, "message": "not a message" }),
+                "BadMessage",
             ),
         ] {
             let response = h.post(path, Some(&cookie), body).await;
@@ -1511,10 +1551,13 @@ mod tests {
         let cookie = h.login().await;
         let response = h
             .client
-            .post(h.url("/api/openpgp/sign"))
+            .post(h.url("/api/openpgp/sign-message"))
             .header("content-type", "text/plain")
             .header("cookie", &cookie)
-            .body(json!({ "pin": PIN, "hash": "sha256", "digest": "" }).to_string())
+            .body(
+                json!({ "pin": PIN, "hash": "sha256", "format": "clearsign", "text": "x" })
+                    .to_string(),
+            )
             .send()
             .await
             .unwrap();
@@ -1589,55 +1632,33 @@ mod tests {
     async fn openpgp_audit_events_are_logged_without_secrets() {
         let h = harness().await;
         let cookie = h.login().await;
-        let signature = h.sign(&cookie, PIN).await.json_value().await["signature"].clone();
+        let armored = h
+            .post(
+                "/api/openpgp/sign-message",
+                Some(&cookie),
+                json!({ "pin": PIN, "hash": "sha256", "format": "detached", "text": "secret-text-to-sign" }),
+            )
+            .await
+            .json_value()
+            .await["armored"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         h.clock.advance(1);
         h.sign(&cookie, "wrong-pin-guess").await;
-        h.clock.advance(10);
-        let ciphertext = BASE64.encode([0x77; 64]);
-        let plaintext = h
-            .post(
-                "/api/openpgp/decrypt",
-                Some(&cookie),
-                json!({ "pin": PIN, "ciphertext": ciphertext }),
-            )
-            .await
-            .json_value()
-            .await["plaintext"]
-            .clone();
-        let auth = h
-            .post(
-                "/api/openpgp/authenticate",
-                Some(&cookie),
-                json!({ "pin": PIN, "data": BASE64.encode(b"ssh-challenge") }),
-            )
-            .await
-            .json_value()
-            .await["signature"]
-            .clone();
         let logs = h.shutdown().await;
-        for event in [
-            "openpgp_sign",
-            "openpgp_pin_failure",
-            "openpgp_decrypt",
-            "openpgp_authenticate",
-        ] {
+        for event in ["openpgp_sign_message", "openpgp_pin_failure"] {
             assert!(
                 logs.contains(&format!("\"event\":\"{event}\"")),
                 "{event} missing from {logs}"
             );
         }
-        let digest_b64 = BASE64.encode(DIGEST);
-        let digest_hex: String = DIGEST.iter().map(|b| format!("{b:02x}")).collect();
+        let signature_line = armored.lines().nth(2).unwrap();
         for secret in [
             PIN,
             "wrong-pin-guess",
-            &digest_b64,
-            &digest_hex,
-            &ciphertext,
-            "ssh-challenge",
-            signature.as_str().unwrap(),
-            plaintext.as_str().unwrap(),
-            auth.as_str().unwrap(),
+            "secret-text-to-sign",
+            signature_line,
         ] {
             assert!(!logs.contains(secret), "log contains {secret:?}");
         }
@@ -1666,10 +1687,9 @@ mod tests {
                 "/api/codes",
                 "/api/lock",
                 "/api/openpgp",
-                "/api/openpgp/authenticate",
-                "/api/openpgp/decrypt",
+                "/api/openpgp/decrypt-message",
                 "/api/openpgp/keys/{slot}",
-                "/api/openpgp/sign",
+                "/api/openpgp/sign-message",
                 "/api/unlock",
                 "/healthz"
             ]

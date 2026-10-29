@@ -11,14 +11,21 @@ use http::Response;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::openpgp::encrypted::DataFormat;
+use crate::openpgp::message::Format;
 use crate::openpgp::proto::{HashAlgorithm, KeySlot, PublicKey};
 use crate::service::{
     Codes, Credential, CredentialState, KeyStatus, OpenPgpStatus, PinRetries, PublicKeyInfo,
 };
 
-/// Largest body accepted by the OpenPGP POST endpoints: room for a base64
-/// RSA 4096 ciphertext and a long PIN.
-pub const OPENPGP_BODY_MAX_BYTES: usize = 4096;
+/// Largest body accepted when signing an OpenPGP message: the text itself
+/// travels in the request.
+pub const OPENPGP_MESSAGE_MAX_BYTES: usize = 64 * 1024;
+
+/// Largest body accepted when recovering a message's session key: the
+/// whole armored message travels in the request, though only its first
+/// packets are read.
+pub const OPENPGP_ENCRYPTED_MAX_BYTES: usize = 1024 * 1024;
 
 /// Unlock request. Deliberately has no `Debug`, so the password cannot end
 /// up in a log by accident.
@@ -158,56 +165,90 @@ impl From<HashName> for HashAlgorithm {
     }
 }
 
-/// Sign request. Deliberately has no `Debug`, so the PIN cannot end up in
-/// a log by accident.
-#[derive(Deserialize, JsonSchema)]
-pub struct SignRequest {
-    /// The OpenPGP user PIN (PW1). Used once and never stored.
-    pub pin: String,
-    pub hash: HashName,
-    /// The digest to sign, base64. The card wraps it in a DigestInfo for
-    /// RSA keys and signs it as is for ECDSA and EdDSA keys.
-    pub digest: String,
+/// What an OpenPGP message signature looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageFormat {
+    /// A cleartext signed message: the text and its signature in one
+    /// `-----BEGIN PGP SIGNED MESSAGE-----` block. Trailing spaces and tabs
+    /// are removed from each line first, so gpg and RFC 9580 tools agree.
+    Clearsign,
+    /// An armored detached signature over the exact UTF-8 bytes of the text.
+    Detached,
 }
 
-/// Decrypt request. Deliberately has no `Debug`.
-#[derive(Deserialize, JsonSchema)]
-pub struct DecryptRequest {
-    /// The OpenPGP user PIN (PW1). Used once and never stored.
-    pub pin: String,
-    /// Base64. For RSA keys, the RSA ciphertext. For ECDH keys, the
-    /// sender's ephemeral public point.
-    pub ciphertext: String,
-}
-
-/// Authenticate request. Deliberately has no `Debug`.
-#[derive(Deserialize, JsonSchema)]
-pub struct AuthenticateRequest {
-    /// The OpenPGP user PIN (PW1). Used once and never stored.
-    pub pin: String,
-    /// Base64 data for the authentication key to sign as is (INTERNAL
-    /// AUTHENTICATE). For RSA keys, send a DigestInfo.
-    pub data: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SignatureResponse {
-    /// The signature, base64.
-    pub signature: String,
-}
-
-impl From<Vec<u8>> for SignatureResponse {
-    fn from(signature: Vec<u8>) -> Self {
-        Self {
-            signature: BASE64.encode(signature),
+impl From<MessageFormat> for Format {
+    fn from(format: MessageFormat) -> Self {
+        match format {
+            MessageFormat::Clearsign => Self::Clearsign,
+            MessageFormat::Detached => Self::Detached,
         }
     }
 }
 
+/// OpenPGP message signing request. Deliberately has no `Debug`.
+#[derive(Deserialize, JsonSchema)]
+pub struct SignMessageRequest {
+    /// The OpenPGP user PIN (PW1). Used once and never stored.
+    pub pin: String,
+    pub hash: HashName,
+    pub format: MessageFormat,
+    /// The text to sign.
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct DecryptResponse {
-    /// The decrypted session key, base64.
-    pub plaintext: String,
+pub struct SignMessageResponse {
+    /// The ASCII-armored result, verifiable with `gpg --verify`.
+    pub armored: String,
+}
+
+/// Request to recover an encrypted message's session key. Deliberately has
+/// no `Debug`.
+#[derive(Deserialize, JsonSchema)]
+pub struct DecryptMessageRequest {
+    /// The OpenPGP user PIN (PW1). Used once and never stored.
+    pub pin: String,
+    /// The whole message, ASCII armored (`-----BEGIN PGP MESSAGE-----`).
+    pub message: String,
+}
+
+/// How a message's data is encrypted, which decides the tools that read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DataFormatName {
+    /// Integrity protected data with an MDC: gpg and Sequoia both read it.
+    SeipdV1,
+    /// RFC 9580 AEAD data.
+    SeipdV2,
+    /// GnuPG's OCB format: gpg reads it, Sequoia does not.
+    GnupgOcb,
+    Unknown,
+}
+
+impl From<DataFormat> for DataFormatName {
+    fn from(format: DataFormat) -> Self {
+        match format {
+            DataFormat::SeipdV1 => Self::SeipdV1,
+            DataFormat::SeipdV2 => Self::SeipdV2,
+            DataFormat::GnupgOcb => Self::GnupgOcb,
+            DataFormat::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// The recovered session key. It opens this one message; handle it like
+/// the message itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DecryptMessageResponse {
+    /// `algorithm:HEX`, for `gpg --override-session-key` or
+    /// `sq decrypt --session-key`.
+    pub session_key: String,
+    /// The symmetric cipher, for example `aes256`.
+    pub cipher: String,
+    /// The recipient key ID the message names for the card's key.
+    pub key_id: String,
+    pub data_format: DataFormatName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -359,38 +400,30 @@ pub trait OathApi {
         path: Path<KeySlotPath>,
     ) -> Result<HttpResponseHeaders<HttpResponseOk<PublicKeyResponse>>, HttpError>;
 
-    /// Sign a digest with the OpenPGP signature key. Needs the user PIN.
+    /// Sign text as an OpenPGP message with the signature key: a cleartext
+    /// signed message or an armored detached signature. Needs the PIN.
     #[endpoint {
         method = POST,
-        path = "/api/openpgp/sign",
-        request_body_max_bytes = OPENPGP_BODY_MAX_BYTES,
+        path = "/api/openpgp/sign-message",
+        request_body_max_bytes = OPENPGP_MESSAGE_MAX_BYTES,
     }]
-    async fn openpgp_sign(
+    async fn openpgp_sign_message(
         rqctx: RequestContext<Self::Context>,
-        body: TypedBody<SignRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseOk<SignatureResponse>>, HttpError>;
+        body: TypedBody<SignMessageRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<SignMessageResponse>>, HttpError>;
 
-    /// Decrypt a session key with the OpenPGP decryption key. Needs the PIN.
+    /// Recover the session key of an armored OpenPGP message encrypted to
+    /// the card's decryption key (RSA or Curve25519). The message itself is
+    /// not decrypted here: pass the session key to gpg or sq. Needs the PIN.
     #[endpoint {
         method = POST,
-        path = "/api/openpgp/decrypt",
-        request_body_max_bytes = OPENPGP_BODY_MAX_BYTES,
+        path = "/api/openpgp/decrypt-message",
+        request_body_max_bytes = OPENPGP_ENCRYPTED_MAX_BYTES,
     }]
-    async fn openpgp_decrypt(
+    async fn openpgp_decrypt_message(
         rqctx: RequestContext<Self::Context>,
-        body: TypedBody<DecryptRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseOk<DecryptResponse>>, HttpError>;
-
-    /// Sign data with the OpenPGP authentication key. Needs the user PIN.
-    #[endpoint {
-        method = POST,
-        path = "/api/openpgp/authenticate",
-        request_body_max_bytes = OPENPGP_BODY_MAX_BYTES,
-    }]
-    async fn openpgp_authenticate(
-        rqctx: RequestContext<Self::Context>,
-        body: TypedBody<AuthenticateRequest>,
-    ) -> Result<HttpResponseHeaders<HttpResponseOk<SignatureResponse>>, HttpError>;
+        body: TypedBody<DecryptMessageRequest>,
+    ) -> Result<HttpResponseHeaders<HttpResponseOk<DecryptMessageResponse>>, HttpError>;
 
     /// Whether the card is reachable and password protected.
     #[endpoint { method = GET, path = "/healthz" }]
@@ -584,23 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn openpgp_requests_parse() {
-        let sign: SignRequest =
-            serde_json::from_str(r#"{"pin":"123456","hash":"sha384","digest":"AA=="}"#).unwrap();
-        assert_eq!(sign.pin, "123456");
-        assert_eq!(HashAlgorithm::from(sign.hash), HashAlgorithm::Sha384);
-        assert_eq!(sign.digest, "AA==");
-        assert!(
-            serde_json::from_str::<SignRequest>(r#"{"pin":"1","hash":"md5","digest":""}"#).is_err()
-        );
-        let decrypt: DecryptRequest =
-            serde_json::from_str(r#"{"pin":"p","ciphertext":"c"}"#).unwrap();
-        assert_eq!(decrypt.ciphertext, "c");
-        let auth: AuthenticateRequest = serde_json::from_str(r#"{"pin":"p","data":"d"}"#).unwrap();
-        assert_eq!(auth.data, "d");
-    }
-
-    #[test]
     fn slot_names_convert_both_ways() {
         for slot in KeySlot::ALL {
             assert_eq!(KeySlot::from(KeySlotName::from(slot)), slot);
@@ -612,8 +628,21 @@ mod tests {
     }
 
     #[test]
-    fn signature_response_is_base64() {
-        assert_eq!(SignatureResponse::from(vec![0, 1, 2]).signature, "AAEC");
+    fn sign_message_request_parses() {
+        let request: SignMessageRequest = serde_json::from_str(
+            r#"{"pin":"123456","hash":"sha512","format":"detached","text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(Format::from(request.format), Format::Detached);
+        assert_eq!(HashAlgorithm::from(request.hash), HashAlgorithm::Sha512);
+        assert_eq!(request.text, "hi");
+        assert_eq!(Format::from(MessageFormat::Clearsign), Format::Clearsign);
+        assert!(
+            serde_json::from_str::<SignMessageRequest>(
+                r#"{"pin":"1","hash":"sha256","format":"inline","text":""}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
