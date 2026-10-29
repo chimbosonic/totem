@@ -1,7 +1,7 @@
 //! API implementation, server context, and server startup.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dropshot::{
     ApiDescription, Body, ConfigDropshot, HandlerTaskMode, HttpError, HttpResponseHeaders,
@@ -33,6 +33,8 @@ pub const REQUEST_BODY_MAX_BYTES: usize = 1024;
 const INDEX_HTML: &str = include_str!("../../static/index.html");
 const APP_JS: &str = include_str!("../../static/app.js");
 const APP_CSS: &str = include_str!("../../static/app.css");
+const DOCS_HTML: &str = include_str!("../../static/docs.html");
+const DOCS_JS: &str = include_str!("../../static/docs.js");
 
 /// Shared state for every request. Everything is behind `Arc` so tests can
 /// build it from mocks.
@@ -89,6 +91,31 @@ impl OathApi for OathApiImpl {
     async fn app_css(_rqctx: RequestContext<ApiContext>) -> Result<Response<Body>, HttpError> {
         secure_result(
             static_file("text/css; charset=utf-8", APP_CSS),
+            RespKind::Static,
+        )
+    }
+
+    async fn openapi(_rqctx: RequestContext<ApiContext>) -> Result<Response<Body>, HttpError> {
+        static OPENAPI: OnceLock<String> = OnceLock::new();
+        secure_result(
+            static_file(
+                "application/json; charset=utf-8",
+                OPENAPI.get_or_init(openapi_json),
+            ),
+            RespKind::Static,
+        )
+    }
+
+    async fn docs(_rqctx: RequestContext<ApiContext>) -> Result<Response<Body>, HttpError> {
+        secure_result(
+            static_file("text/html; charset=utf-8", DOCS_HTML),
+            RespKind::Static,
+        )
+    }
+
+    async fn docs_js(_rqctx: RequestContext<ApiContext>) -> Result<Response<Body>, HttpError> {
+        secure_result(
+            static_file("text/javascript; charset=utf-8", DOCS_JS),
             RespKind::Static,
         )
     }
@@ -733,6 +760,8 @@ mod tests {
             ("/", "text/html; charset=utf-8", INDEX_HTML),
             ("/app.js", "text/javascript; charset=utf-8", APP_JS),
             ("/app.css", "text/css; charset=utf-8", APP_CSS),
+            ("/docs", "text/html; charset=utf-8", DOCS_HTML),
+            ("/docs.js", "text/javascript; charset=utf-8", DOCS_JS),
         ] {
             let response = h.get(path, None).await;
             assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -747,13 +776,34 @@ mod tests {
         h.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn openapi_document_is_served_as_generated() {
+        let h = harness().await;
+        let response = h.get("/openapi.json", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header(&response, "content-type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_security_headers(&response, false);
+        assert_eq!(response.text().await.unwrap(), openapi_json());
+        h.shutdown().await;
+    }
+
     // Static file rules. The CSP (default-src 'self') would silently break
     // anything inline, so check the files themselves.
 
-    const STATIC_FILES: [(&str, &str); 3] = [
+    const STATIC_FILES: [(&str, &str); 5] = [
         ("index.html", INDEX_HTML),
         ("app.js", APP_JS),
         ("app.css", APP_CSS),
+        ("docs.html", DOCS_HTML),
+        ("docs.js", DOCS_JS),
+    ];
+
+    const PAGES: [(&str, &str, &str); 2] = [
+        ("index.html", INDEX_HTML, APP_JS),
+        ("docs.html", DOCS_HTML, DOCS_JS),
     ];
 
     /// Attribute names in `html` that start with `on`, like `onclick`.
@@ -777,25 +827,31 @@ mod tests {
     }
 
     #[test]
-    fn index_has_no_inline_script_style_or_handlers() {
-        let lower = INDEX_HTML.to_ascii_lowercase();
+    fn pages_have_no_inline_script_style_or_handlers() {
+        for (name, html, _) in PAGES {
+            assert_no_inline_code(name, html);
+        }
+    }
+
+    fn assert_no_inline_code(name: &str, html: &str) {
+        let lower = html.to_ascii_lowercase();
         let mut rest = lower.as_str();
         let mut scripts = 0;
         while let Some(start) = rest.find("<script") {
             let tag_end = rest[start..].find('>').unwrap() + start;
             let tag = &rest[start..=tag_end];
-            assert!(tag.contains("src="), "inline script: {tag}");
+            assert!(tag.contains("src="), "{name}: inline script: {tag}");
             assert!(
                 rest[tag_end + 1..].starts_with("</script>"),
-                "script has a body: {tag}"
+                "{name}: script has a body: {tag}"
             );
             scripts += 1;
             rest = &rest[tag_end..];
         }
-        assert_eq!(scripts, 1);
-        assert!(!lower.contains("<style"), "inline <style>");
-        assert!(!lower.contains(" style="), "style attribute");
-        assert_eq!(inline_handlers(INDEX_HTML), Vec::<String>::new());
+        assert_eq!(scripts, 1, "{name}");
+        assert!(!lower.contains("<style"), "{name}: inline <style>");
+        assert!(!lower.contains(" style="), "{name}: style attribute");
+        assert_eq!(inline_handlers(html), Vec::<String>::new(), "{name}");
     }
 
     #[test]
@@ -831,26 +887,28 @@ mod tests {
     }
 
     #[test]
-    fn every_element_app_js_looks_up_exists_in_index() {
-        let mut ids = Vec::new();
-        let mut rest = APP_JS;
-        while let Some(start) = rest.find("getElementById(\"") {
-            let after = &rest[start + "getElementById(\"".len()..];
-            let end = after.find('"').unwrap();
-            ids.push(&after[..end]);
-            rest = &after[end..];
-        }
-        assert!(ids.len() >= 5, "app.js looks up {ids:?}");
-        for id in ids {
-            assert!(
-                INDEX_HTML.contains(&format!("id=\"{id}\"")),
-                "index.html has no id {id:?}"
-            );
+    fn every_element_a_script_looks_up_exists_in_its_page() {
+        for (name, html, js) in PAGES {
+            let mut ids = Vec::new();
+            let mut rest = js;
+            while let Some(start) = rest.find("getElementById(\"") {
+                let after = &rest[start + "getElementById(\"".len()..];
+                let end = after.find('"').unwrap();
+                ids.push(&after[..end]);
+                rest = &after[end..];
+            }
+            assert!(ids.len() >= 5, "{name}: script looks up {ids:?}");
+            for id in ids {
+                assert!(
+                    html.contains(&format!("id=\"{id}\"")),
+                    "{name} has no id {id:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn app_js_never_parses_strings_as_html_or_code() {
+    fn scripts_never_parse_strings_as_html_or_code() {
         for banned in [
             "innerHTML",
             "outerHTML",
@@ -860,7 +918,9 @@ mod tests {
             "new Function",
             "setAttribute(\"style\"",
         ] {
-            assert!(!APP_JS.contains(banned), "app.js uses {banned}");
+            for (name, _, js) in PAGES {
+                assert!(!js.contains(banned), "script for {name} uses {banned}");
+            }
         }
     }
 
@@ -887,7 +947,7 @@ mod tests {
             assert_security_headers(&response, api_path);
             seen += 1;
         }
-        assert_eq!(seen, 7);
+        assert_eq!(seen, 10);
         h.shutdown().await;
     }
 

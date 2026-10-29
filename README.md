@@ -187,6 +187,8 @@ the session ID. Tests check that none of the secrets appear in the logs.
 | Method | Path | Auth | Response |
 |---|---|---|---|
 | GET | `/`, `/app.js`, `/app.css` | none | Web page |
+| GET | `/docs`, `/docs.js` | none | API docs page |
+| GET | `/openapi.json` | none | The OpenAPI document |
 | POST | `/api/unlock` | none | `204` and session cookie; `401` wrong password; `429` with `Retry-After` |
 | POST | `/api/lock` | session | `204` |
 | GET | `/api/codes` | session | `200` JSON; `401` no or expired session; `503` key unavailable |
@@ -194,7 +196,9 @@ the session ID. Tests check that none of the secrets appear in the logs.
 
 POST requests must send `Content-Type: application/json`. The session cookie
 is `HttpOnly; Secure; SameSite=Strict`. The full schema is in
-[`openapi/totem.json`](openapi/totem.json), generated from the code.
+[`openapi/totem.json`](openapi/totem.json), generated from the code by
+Dropshot. The running service also serves it at `/openapi.json`, and renders
+it at `/docs` (linked from the main page).
 
 ## Development
 

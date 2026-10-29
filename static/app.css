@@ -288,3 +288,53 @@ footer {
 .note {
   max-width: 780px;
 }
+
+/* API docs page (/docs). */
+
+a {
+  color: var(--accent-2);
+}
+
+.op,
+.schema {
+  margin-bottom: 16px;
+}
+
+.op-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.method {
+  color: var(--accent);
+}
+
+.path {
+  font-size: 15px;
+}
+
+.kv {
+  margin-top: 6px;
+}
+
+table.fields {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 14px;
+  font-size: 13px;
+}
+
+table.fields th,
+table.fields td {
+  text-align: left;
+  vertical-align: top;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+}
+
+table.fields th {
+  color: var(--muted);
+  font-weight: normal;
+}
