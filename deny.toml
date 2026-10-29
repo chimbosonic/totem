@@ -1,0 +1,64 @@
+# cargo-deny configuration: `cargo deny check` (also run in CI).
+# Every exception below says why it is acceptable. Review them when
+# dependencies change.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    # Marvin attack: timing of RSA *private-key* operations. `rsa` is a dev
+    # dependency only, used by tests to *verify* signatures with public
+    # keys. No fixed release exists (0.10 is a release candidate).
+    { id = "RUSTSEC-2023-0071", reason = "dev-only rsa, public-key verification in tests; no fix released" },
+    # Unmaintained proc-macro used by dropshot at compile time; no code from
+    # it runs in the binary.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time only (dropshot proc-macro)" },
+    # Unmaintained PEM parser used by dropshot to load TLS certificates.
+    # totem never configures TLS in dropshot (the reverse proxy terminates
+    # TLS), so this code is never reached.
+    { id = "RUSTSEC-2025-0134", reason = "only reached when dropshot is given TLS config, which totem never does" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licenses only. Copyleft is allowed per crate, below.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+exceptions = [
+    # MPL-2.0 only (file-level copyleft), pulled in by dropshot. The other
+    # slog crates are also offered under MIT or Apache-2.0.
+    { allow = ["MPL-2.0"], crate = "slog-bunyan" },
+]
+
+[licenses.private]
+# totem itself is not published.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

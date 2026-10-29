@@ -2,6 +2,7 @@
 name = "totem"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [features]
 # Tests in tests/hardware.rs that talk to a real YubiKey. Off by default.
