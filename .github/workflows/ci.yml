@@ -114,9 +114,12 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Run every target
+        # cargo-fuzz defaults to the target it was built for, and the
+        # prebuilt binary is musl; build for the toolchain's host instead.
         run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
           for target in $(cargo fuzz list); do
-            cargo fuzz run "$target" -- -max_total_time="$FUZZ_SECONDS"
+            cargo fuzz run --target "$host" "$target" -- -max_total_time="$FUZZ_SECONDS"
           done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
