@@ -1,11 +1,17 @@
-//! In-memory YKOATH card for tests.
+//! In-memory YubiKey for tests: a YKOATH applet and, optionally, an
+//! OpenPGP applet (see [`openpgp`]). SELECT picks which one gets the
+//! following APDUs, as on a real card.
 //!
-//! Implements SELECT, VALIDATE, CALCULATE ALL, CALCULATE, and SEND REMAINING
-//! chunking. Clones share state, so a test can keep a handle to inspect
-//! events and inject faults after handing the card to the service.
+//! The OATH applet implements SELECT, VALIDATE, CALCULATE ALL, CALCULATE,
+//! and SEND REMAINING chunking. Clones share state, so a test can keep a
+//! handle to inspect events and inject faults after handing the card to the
+//! service. Command chaining (CLA `0x10`) and GET RESPONSE are supported for
+//! the OpenPGP applet.
 //!
 //! Not emulated: touch (CALCULATE on a touch or HOTP credential is refused)
 //! and credential management.
+
+pub mod openpgp;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -13,7 +19,9 @@ use super::{Card, CardError, CardTransaction};
 use crate::oath::crypto::{self, Algorithm, DerivedKey};
 use crate::oath::proto::AID;
 use crate::oath::tlv;
+use crate::openpgp::proto::AID_PREFIX as OPENPGP_AID_PREFIX;
 use crate::rng::{ChallengeSource, SequentialChallengeSource};
+use openpgp::MockOpenPgp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockKind {
@@ -83,7 +91,19 @@ const SW_WRONG_DATA: u16 = 0x6A80;
 const SW_FILE_NOT_FOUND: u16 = 0x6A82;
 const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 
+/// Which applet the last successful SELECT chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applet {
+    None,
+    Oath,
+    OpenPgp,
+}
+
 struct State {
+    applet: Applet,
+    openpgp: Option<MockOpenPgp>,
+    /// Data from command-chained APDUs waiting for the final part.
+    chained: Vec<u8>,
     version: [u8; 3],
     device_id: [u8; 8],
     key: Option<DerivedKey>,
@@ -104,28 +124,21 @@ type Reply = Result<Vec<u8>, u16>;
 impl State {
     /// Forget selection and unlock, as a reconnect, removal, or reset does.
     fn drop_session(&mut self) {
+        self.applet = Applet::None;
         self.selected = false;
         self.unlocked = false;
         self.challenge = None;
         self.pending.clear();
+        self.chained.clear();
+        if let Some(openpgp) = &mut self.openpgp {
+            openpgp.reset_verification();
+        }
     }
 
     fn handle(&mut self, apdu: &[u8]) -> Vec<u8> {
         let reply = match parse_apdu(apdu) {
             None => Err(SW_WRONG_LENGTH),
-            Some((ins, p1, data)) => {
-                if ins != INS_SEND_REMAINING {
-                    self.pending.clear();
-                }
-                match (ins, p1) {
-                    (INS_SELECT_OR_CALCULATE_ALL, 0x04) => self.select(data),
-                    (INS_SELECT_OR_CALCULATE_ALL, _) => self.calculate_all(data),
-                    (INS_VALIDATE, _) => self.validate(data),
-                    (INS_CALCULATE, _) => self.calculate(data),
-                    (INS_SEND_REMAINING, _) => Ok(std::mem::take(&mut self.pending)),
-                    _ => Err(SW_INS_NOT_SUPPORTED),
-                }
-            }
+            Some(command) => self.dispatch(command),
         };
         match reply {
             Err(sw) => sw.to_be_bytes().to_vec(),
@@ -142,10 +155,68 @@ impl State {
         }
     }
 
+    fn dispatch(&mut self, apdu: Apdu<'_>) -> Reply {
+        let Apdu {
+            cla,
+            ins,
+            p1,
+            p2,
+            data,
+        } = apdu;
+        let continuation = match self.applet {
+            Applet::OpenPgp => openpgp::INS_GET_RESPONSE,
+            Applet::Oath | Applet::None => INS_SEND_REMAINING,
+        };
+        if ins == continuation {
+            return Ok(std::mem::take(&mut self.pending));
+        }
+        self.pending.clear();
+        if cla & CLA_CHAIN != 0 {
+            if self.applet != Applet::OpenPgp {
+                return Err(SW_CLA_NOT_SUPPORTED);
+            }
+            self.chained.extend_from_slice(data);
+            return Ok(Vec::new());
+        }
+        let mut chained = std::mem::take(&mut self.chained);
+        let data = if chained.is_empty() {
+            data
+        } else {
+            chained.extend_from_slice(data);
+            &chained[..]
+        };
+        if (ins, p1) == (INS_SELECT_OR_CALCULATE_ALL, 0x04) {
+            return self.select(data);
+        }
+        match (self.applet, ins) {
+            (Applet::OpenPgp, _) => self
+                .openpgp
+                .as_mut()
+                .expect("OpenPGP selected")
+                .handle(ins, p1, p2, data),
+            (_, INS_SELECT_OR_CALCULATE_ALL) => self.calculate_all(data),
+            (_, INS_VALIDATE) => self.validate(data),
+            (_, INS_CALCULATE) => self.calculate(data),
+            _ => Err(SW_INS_NOT_SUPPORTED),
+        }
+    }
+
     fn select(&mut self, data: &[u8]) -> Reply {
+        if let Some(openpgp) = &mut self.openpgp
+            && data.starts_with(&OPENPGP_AID_PREFIX)
+            && openpgp.aid().starts_with(data)
+        {
+            self.applet = Applet::OpenPgp;
+            self.selected = false;
+            self.unlocked = false;
+            self.challenge = None;
+            openpgp.reset_verification();
+            return Ok(Vec::new());
+        }
         if data != AID {
             return Err(SW_FILE_NOT_FOUND);
         }
+        self.applet = Applet::Oath;
         self.selected = true;
         self.unlocked = self.key.is_none();
         let mut out = Vec::new();
@@ -239,17 +310,37 @@ const TAG_VERSION: u8 = 0x79;
 const TAG_ALGORITHM: u8 = 0x7B;
 const TAG_TOUCH: u8 = 0x7C;
 const ALGORITHM_SHA1: u8 = 0x01;
+const CLA_CHAIN: u8 = 0x10;
+const SW_CLA_NOT_SUPPORTED: u16 = 0x6E00;
 
-/// Split a short APDU into INS, P1, and data. `None` if the length is wrong.
-fn parse_apdu(apdu: &[u8]) -> Option<(u8, u8, &[u8])> {
+/// A short APDU split into its parts.
+struct Apdu<'a> {
+    cla: u8,
+    ins: u8,
+    p1: u8,
+    p2: u8,
+    data: &'a [u8],
+}
+
+/// Split a short APDU. A lone byte after the header is `Le`, and `Le` may
+/// also follow the data. `None` if the length is wrong.
+fn parse_apdu(apdu: &[u8]) -> Option<Apdu<'_>> {
     let (header, rest) = apdu.split_first_chunk::<4>()?;
-    let [_, ins, p1, _] = *header;
+    let [cla, ins, p1, p2] = *header;
     let data = match rest.split_first() {
         None => &[][..],
+        Some((_, [])) => &[][..],
         Some((&lc, data)) if data.len() == usize::from(lc) => data,
+        Some((&lc, data)) if data.len() == usize::from(lc) + 1 => &data[..usize::from(lc)],
         Some(_) => return None,
     };
-    Some((ins, p1, data))
+    Some(Apdu {
+        cla,
+        ins,
+        p1,
+        p2,
+        data,
+    })
 }
 
 fn find(data: &[u8], tag: u8) -> Result<Vec<u8>, u16> {
@@ -282,6 +373,9 @@ impl MockCard {
     /// A card with no password and no credentials.
     pub fn new() -> Self {
         let state = State {
+            applet: Applet::None,
+            openpgp: None,
+            chained: Vec::new(),
             version: Self::DEFAULT_VERSION,
             device_id: Self::DEFAULT_DEVICE_ID,
             key: None,
@@ -312,6 +406,25 @@ impl MockCard {
             state.key = Some(crypto::derive_key(password, &state.device_id));
         }
         self
+    }
+
+    /// Add an OpenPGP applet.
+    pub fn with_openpgp(self, openpgp: MockOpenPgp) -> Self {
+        self.state().openpgp = Some(openpgp);
+        self
+    }
+
+    /// Inspect the OpenPGP applet, for example its retry counter.
+    ///
+    /// # Panics
+    ///
+    /// If the card has no OpenPGP applet.
+    pub fn openpgp<T>(&self, f: impl FnOnce(&MockOpenPgp) -> T) -> T {
+        f(self
+            .state()
+            .openpgp
+            .as_ref()
+            .expect("card has an OpenPGP applet"))
     }
 
     pub fn with_credential(self, credential: MockCredential) -> Self {

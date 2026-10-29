@@ -20,6 +20,7 @@ import sys
 # --ignore-filename-regex that excludes card/pcsc.rs, main.rs, and tests/).
 RULES = [
     ("oath::*", "src/oath/", 95.0),
+    ("openpgp::*", "src/openpgp/", 95.0),
     ("session", "src/session.rs", 95.0),
     ("ratelimit", "src/ratelimit.rs", 95.0),
     ("crate", "", 85.0),

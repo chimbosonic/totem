@@ -5,6 +5,7 @@ pub mod mock;
 pub mod pcsc;
 
 use crate::oath::proto::{self, Command, ProtoError};
+use crate::openpgp::proto::{self as pgp, PgpError};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CardError {
@@ -18,12 +19,14 @@ pub enum CardError {
     Reader(String),
     #[error(transparent)]
     Proto(#[from] ProtoError),
+    #[error(transparent)]
+    OpenPgp(#[from] PgpError),
 }
 
 impl CardError {
     /// Whether dropping the connection and reconnecting might fix this.
     pub fn needs_reconnect(&self) -> bool {
-        !matches!(self, Self::Proto(_))
+        !matches!(self, Self::Proto(_) | Self::OpenPgp(_))
     }
 }
 
@@ -60,6 +63,29 @@ pub fn send(
 ) -> Result<Vec<u8>, CardError> {
     let response = proto::transmit_chained(|a| tx.transmit(a), apdu)?;
     Ok(response.into_data(command)?)
+}
+
+/// Send one OpenPGP command, given as its command-chained APDUs, follow
+/// GET RESPONSE chaining, and return the response data if every part
+/// succeeded.
+///
+/// # Panics
+///
+/// If `apdus` is empty.
+pub fn send_openpgp<A: AsRef<[u8]>>(
+    tx: &mut dyn CardTransaction,
+    apdus: &[A],
+    command: pgp::Command,
+) -> Result<Vec<u8>, CardError> {
+    let (last, parts) = apdus.split_last().expect("at least one APDU");
+    let get_response = pgp::get_response_apdu();
+    for part in parts {
+        let response =
+            proto::transmit_chained_with(|a| tx.transmit(a), part.as_ref(), &get_response)?;
+        pgp::check_status(command, response.data, response.sw)?;
+    }
+    let response = proto::transmit_chained_with(|a| tx.transmit(a), last.as_ref(), &get_response)?;
+    Ok(pgp::check_status(command, response.data, response.sw)?)
 }
 
 #[cfg(test)]
@@ -131,6 +157,45 @@ mod tests {
         assert!(CardError::Reader("gone".into()).needs_reconnect());
         assert!(!CardError::Proto(ProtoError::WrongPassword).needs_reconnect());
         assert!(!CardError::Proto(ProtoError::Status(0x6A80)).needs_reconnect());
+        assert!(!CardError::OpenPgp(PgpError::WrongPin).needs_reconnect());
+    }
+
+    #[test]
+    fn send_openpgp_sends_every_chained_part_and_follows_get_response() {
+        let mut tx = script(vec![
+            Ok(hex!("9000").to_vec()),
+            Ok(hex!("01026101").to_vec()),
+            Ok(hex!("039000").to_vec()),
+        ]);
+        let apdus = [vec![0x10, 0xAA], vec![0x00, 0xBB]];
+        assert_eq!(
+            send_openpgp(&mut tx, &apdus, pgp::Command::Decipher),
+            Ok(vec![1, 2, 3])
+        );
+        assert_eq!(
+            tx.sent,
+            vec![vec![0x10, 0xAA], vec![0x00, 0xBB], pgp::get_response_apdu()]
+        );
+    }
+
+    #[test]
+    fn send_openpgp_stops_at_a_failed_chained_part() {
+        let mut tx = script(vec![Ok(hex!("6982").to_vec())]);
+        let apdus = [vec![0x10, 0xAA], vec![0x00, 0xBB]];
+        assert_eq!(
+            send_openpgp(&mut tx, &apdus, pgp::Command::Sign),
+            Err(CardError::OpenPgp(PgpError::NotVerified))
+        );
+        assert_eq!(tx.sent.len(), 1);
+    }
+
+    #[test]
+    fn send_openpgp_maps_status_for_the_command() {
+        let mut tx = script(vec![Ok(hex!("63c2").to_vec())]);
+        assert_eq!(
+            send_openpgp(&mut tx, &[[0x00]], pgp::Command::Verify),
+            Err(CardError::OpenPgp(PgpError::WrongPin))
+        );
     }
 
     #[test]

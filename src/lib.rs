@@ -6,6 +6,7 @@ pub mod clock;
 pub mod config;
 pub mod logging;
 pub mod oath;
+pub mod openpgp;
 pub mod ratelimit;
 pub mod rng;
 pub mod service;

@@ -50,6 +50,7 @@ class CheckTests(unittest.TestCase):
         doc = summary(
             {
                 "/repo/src/oath/tlv.rs": (95, 100),
+                "/repo/src/openpgp/proto.rs": (96, 100),
                 "/repo/src/session.rs": (95, 100),
                 "/repo/src/ratelimit.rs": (100, 100),
                 "/repo/src/api/server.rs": (55, 100),
@@ -57,12 +58,15 @@ class CheckTests(unittest.TestCase):
         )
         failures, rows = gate.check(doc, ROOT)
         self.assertEqual(failures, [])
-        self.assertEqual([r[0] for r in rows], ["oath::*", "session", "ratelimit", "crate"])
+        self.assertEqual(
+            [r[0] for r in rows], ["oath::*", "openpgp::*", "session", "ratelimit", "crate"]
+        )
 
     def test_fails_a_module_below_95(self):
         doc = summary(
             {
                 "/repo/src/oath/tlv.rs": (94, 100),
+                "/repo/src/openpgp/tlv.rs": (100, 100),
                 "/repo/src/session.rs": (100, 100),
                 "/repo/src/ratelimit.rs": (100, 100),
             }
@@ -76,6 +80,7 @@ class CheckTests(unittest.TestCase):
         doc = summary(
             {
                 "/repo/src/oath/tlv.rs": (100, 100),
+                "/repo/src/openpgp/tlv.rs": (100, 100),
                 "/repo/src/session.rs": (100, 100),
                 "/repo/src/ratelimit.rs": (100, 100),
                 "/repo/src/api/server.rs": (0, 100),
