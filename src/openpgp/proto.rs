@@ -47,6 +47,10 @@ const KDF_NONE: u8 = 0x00;
 const KDF_ITERSALTED_S2K: u8 = 0x03;
 const KDF_HASH_SHA256: u8 = 0x08;
 const KDF_HASH_SHA512: u8 = 0x0A;
+/// Largest S2K byte count OpenPGP can encode (RFC 9580 section 3.7.1.3),
+/// and gpg's default. A card asking for more would make every PIN attempt
+/// hash gigabytes, so that is refused as malformed.
+pub const KDF_MAX_COUNT: u32 = 65_011_712;
 const TAG_AID: u16 = 0x4F;
 const TAG_FINGERPRINTS: u16 = 0xC5;
 const TAG_GENERATION_TIMES: u16 = 0xCD;
@@ -615,6 +619,11 @@ pub fn parse_kdf(data: &[u8]) -> Result<Kdf, PgpError> {
         .and_then(|v| <[u8; 4]>::try_from(v).ok())
         .map(u32::from_be_bytes)
         .ok_or(PgpError::Malformed("KDF-DO without a 4 byte count"))?;
+    if count > KDF_MAX_COUNT {
+        return Err(PgpError::Malformed(
+            "KDF-DO count above the OpenPGP maximum",
+        ));
+    }
     let pw1_salt = field(TAG_KDF_PW1_SALT)?
         .filter(|salt| !salt.is_empty())
         .ok_or(PgpError::Malformed("KDF-DO without a PW1 salt"))?
@@ -1112,6 +1121,23 @@ mod tests {
     }
 
     #[test]
+    fn kdf_count_above_the_openpgp_maximum_is_refused() {
+        // A card claiming a huge count would make every PIN attempt hash
+        // gigabytes. 65011712 is the largest count OpenPGP can encode.
+        let salt = [1; 8];
+        assert!(parse_kdf(&kdf_do(0x03, 0x08, 65_011_712, &salt)).is_ok());
+        for count in [65_011_713, u32::MAX] {
+            assert!(
+                matches!(
+                    parse_kdf(&kdf_do(0x03, 0x08, count, &salt)),
+                    Err(PgpError::Malformed(_))
+                ),
+                "{count}"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_kdf_or_hash_is_unsupported() {
         assert_eq!(
             parse_kdf(&hex!("810107")).unwrap(),
@@ -1173,6 +1199,63 @@ mod tests {
                 "7652a290f43ea00ba634235dc6220d40b6a9e86a346af967906ef3ac51a4bee1"
             )
         );
+    }
+
+    /// Reference values from GnuPG 2.5.24, an independent implementation of
+    /// the same S2K: `gpg --rfc4880 --symmetric --cipher-algo AES256
+    /// --s2k-mode 3` with passphrase `pin-123456`, then
+    /// `--show-session-key`. With no encrypted session key, the session key
+    /// is the S2K output cut to the 32-byte AES-256 key size. Salt and
+    /// count are from `gpg --list-packets` (see AGENT.md).
+    #[test]
+    fn s2k_matches_gnupg() {
+        let cases: [(KdfHash, [u8; 8], u32, [u8; 32]); 6] = [
+            (
+                KdfHash::Sha256,
+                hex!("8B69CEC27E063E9A"),
+                65_536,
+                hex!("9BA009CC71CFAFDCE315E389790F236DA34BB0C851281D901AF911AB4EF69B81"),
+            ),
+            (
+                KdfHash::Sha256,
+                hex!("4220B539A9A91E27"),
+                33_554_432,
+                hex!("1D3584BEDFEFCE75EBD58F62BCE4D223A82A2FDFDCF1CEBFD0BF4E9078D820FB"),
+            ),
+            (
+                KdfHash::Sha256,
+                hex!("25C864AD389EB586"),
+                65_011_712,
+                hex!("B8C5FB555184EBAF450E07AC86716F53D3C4B64BDA32BC4B82069DC39696A5EE"),
+            ),
+            (
+                KdfHash::Sha512,
+                hex!("46270F5C9A9C4E80"),
+                65_536,
+                hex!("1551FE6D954D25267D47AD651C943354438E27528E8352B8B029645188AD3CC1"),
+            ),
+            (
+                KdfHash::Sha512,
+                hex!("39859E2B2A3A0EE5"),
+                33_554_432,
+                hex!("DCFE66733621C8949E2E14820A8DE35243CF1CFCF38B6417C53AC1AAE20A7630"),
+            ),
+            (
+                KdfHash::Sha512,
+                hex!("51FC74C221F747F7"),
+                65_011_712,
+                hex!("EB4453AFCB459B99D6E525DABC6FE322FE320B7E2D8613C3C50F81672D5613CE"),
+            ),
+        ];
+        for (hash, salt, count, expected) in cases {
+            let kdf = Kdf::IterSaltedS2k {
+                hash,
+                count,
+                pw1_salt: salt.to_vec(),
+            };
+            let derived = kdf_pin(&kdf, b"pin-123456");
+            assert_eq!(derived[..32], expected, "{hash:?} count {count}");
+        }
     }
 
     #[test]
