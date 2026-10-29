@@ -1,9 +1,10 @@
 # totem
 
 A web front end for YubiKey features, run on the host the key is plugged into.
-Today it covers the OATH applet (TOTP codes on a web page) and, over the
-API, the OpenPGP applet (sign, decrypt, and authenticate with keys already on
-the key, so it can act as a small network HSM).
+Today it covers the OATH applet (TOTP codes) and the OpenPGP applet
+(OpenPGP signed messages and decrypting OpenPGP messages with keys already
+on the key, so it can act as a small network HSM), on the web page and over
+the API.
 
 The current release is a small Rust service that reads TOTP codes from a
 YubiKey's OATH applet over PC/SC and shows them on an internal web page.
@@ -185,14 +186,37 @@ Does not protect against:
 The second factor becomes "knows the password and is on the LAN" rather than
 "holds the key". That is an accepted trade-off.
 
+### How the security-relevant code is checked
+
+totem implements no cryptographic primitive: hashing, HMAC, PBKDF2, and
+constant-time comparison come from RustCrypto (`sha1`, `sha2`, `hmac`,
+`pbkdf2`, `subtle`), randomness from `getrandom`, and every private key
+operation happens on the YubiKey. What it does implement is protocol code
+around those, and each piece is checked against an implementation it did
+not write:
+
+| Code | Checked against |
+|---|---|
+| OATH unlock and codes (PBKDF2 parameters, HMAC challenge and response, truncation) | the YKOATH spec, HMAC vectors from RFC 2202 and 4231, code vectors from RFC 4226 and 6238, a PBKDF2 value from Python `hashlib`, and a real key |
+| OpenPGP PIN KDF (iterated and salted S2K) | values produced by GnuPG for the same salt, count, and passphrase |
+| RSA DigestInfo prefixes | the RustCrypto `rsa` crate's own prefixes |
+| OpenPGP signed messages (packets, armor, cleartext rules) | `gpg --verify` on 108 RSA, Ed25519, and P-256 combinations; pinned fixtures are re-verified on every test run with `rsa`, `ed25519-dalek`, and `p256` |
+| Session key recovery from encrypted messages (packets, RSA, Curve25519 key derivation; key unwrap is RustCrypto `aes-kw`) | gpg's own `--show-session-key` for messages made by gpg and by Sequoia; decrypting with the result in gpg and sq |
+| Parsers of card responses, chaining, encrypted messages | `cargo fuzz` (arbitrary bytes must give an error, never a panic or a hang) |
+
+Values from the card are treated as untrusted: for example a KDF iteration
+count above the largest OpenPGP can encode (65011712) is refused, so a bad
+card cannot make each PIN attempt hash gigabytes. Dependencies are checked
+with `cargo deny` and `cargo audit` in CI. The crate forbids `unsafe` code.
+
 ### What is never logged
 
 The password, the derived key, raw session IDs, and codes. For OpenPGP, the
-PIN and the data: digests, ciphertexts, plaintexts, and signatures. Audit
+PIN and the data: texts, messages, signatures, and session keys. Audit
 events (`unlock_success`, `unlock_failure`, `global_lockout_engaged`,
-`codes_fetched`, `lock`, `card_error`, `openpgp_sign`, `openpgp_decrypt`,
-`openpgp_authenticate`, `openpgp_pin_failure`, `openpgp_pin_lockout_engaged`,
-`openpgp_pin_floor_reached`) log the client IP and a short hash of the
+`codes_fetched`, `lock`, `card_error`, `openpgp_sign_message`,
+`openpgp_decrypt_message`, `openpgp_pin_failure`,
+`openpgp_pin_lockout_engaged`, `openpgp_pin_floor_reached`) log the client IP and a short hash of the
 session ID. OpenPGP use events also log the key slot and the first 4 bytes of
 the SHA-256 of the input, so requests can be matched up without logging the
 input. Tests check that none of the secrets appear in the logs.
@@ -209,9 +233,8 @@ input. Tests check that none of the secrets appear in the logs.
 | GET | `/api/codes` | session | `200` JSON; `401` no or expired session; `503` key unavailable |
 | GET | `/api/openpgp` | session | `200` keys, PIN retry counters, signature count; `404` no OpenPGP applet |
 | GET | `/api/openpgp/keys/{slot}` | session | `200` public key of `sign`, `decrypt`, or `auth`; `404` empty slot |
-| POST | `/api/openpgp/sign` | session + PIN | `200` signature over a digest |
-| POST | `/api/openpgp/decrypt` | session + PIN | `200` decrypted session key |
-| POST | `/api/openpgp/authenticate` | session + PIN | `200` signature with the authentication key |
+| POST | `/api/openpgp/sign-message` | session + PIN | `200` armored OpenPGP clearsigned message or detached signature |
+| POST | `/api/openpgp/decrypt-message` | session + PIN | `200` session key of an armored encrypted message, for gpg or sq |
 | GET | `/healthz` | none | `200` if the key is reachable and password protected, else `503` |
 
 POST requests must send `Content-Type: application/json`. The session cookie
@@ -222,27 +245,59 @@ it at `/docs` (linked from the main page).
 
 ### OpenPGP
 
+The web page has an **OpenPGP** tab next to the codes. It shows the card
+(version, serial, PIN tries left, signature count, KDF), each key with its
+fingerprint and touch policy, and its public key on request. A form
+decrypts OpenPGP messages (it recovers the session key and shows the gpg
+and sq commands that use it), and makes OpenPGP clearsigned messages and
+armored detached signatures. The PIN field is cleared after every request,
+and keys that cannot be used (empty slot, touch policy) are disabled with
+the reason shown.
+
 The OpenPGP endpoints use keys already on the key. They need an unlocked
-session (the OATH password) and, for sign, decrypt, and authenticate, the
-OpenPGP user PIN in the request body. The PIN is used for that one request
-and never stored. Binary values are base64.
+session (the OATH password) and, for signing and decrypting, the OpenPGP
+user PIN in the request body. The PIN is used for that one request and
+never stored. The card's lower-level operations (signing a bare digest,
+raw decryption, INTERNAL AUTHENTICATE) are not exposed.
 
 ```sh
 # After POST /api/unlock, with the session cookie in $COOKIE:
 curl -s -b "$COOKIE" https://totem.lan/api/openpgp
-digest=$(printf 'hello' | openssl dgst -sha256 -binary | base64)
 curl -s -b "$COOKIE" -H 'content-type: application/json' \
-  -d "{\"pin\":\"$PIN\",\"hash\":\"sha256\",\"digest\":\"$digest\"}" \
-  https://totem.lan/api/openpgp/sign
+  -d "{\"pin\":\"$PIN\",\"hash\":\"sha256\",\"format\":\"clearsign\",\"text\":\"hello\"}" \
+  https://totem.lan/api/openpgp/sign-message
 ```
 
-- Sign takes a digest and the hash that made it (`sha256`, `sha384`, or
-  `sha512`). For RSA keys the service wraps it in a PKCS #1 DigestInfo; for
-  ECDSA and EdDSA keys it is signed as is.
-- Decrypt takes the RSA ciphertext for RSA keys, or the sender's ephemeral
-  public point for ECDH keys, and returns the session key.
-- Authenticate signs `data` as is with the authentication key. For RSA keys,
-  send a DigestInfo.
+- Sign message takes text, a hash, and a format, and returns ASCII armor
+  that `gpg --verify` accepts: `clearsign` gives a
+  `-----BEGIN PGP SIGNED MESSAGE-----` block, `detached` gives a
+  `-----BEGIN PGP SIGNATURE-----` block over the exact bytes of the text
+  (save it as `file.asc` next to `file` and run `gpg --verify file.asc
+  file`). The service builds a version 4 signature packet and its armor
+  (`src/openpgp/message.rs`) around one signature from the card; the issuer
+  fingerprint is the card's. RSA, ECDSA, and EdDSA keys work. Before
+  clearsigning, trailing spaces and tabs are removed from each line and
+  line endings are shown as LF: gpg ignores trailing whitespace when it
+  verifies a cleartext message and RFC 9580 tools do not, so trimming it
+  first keeps both happy. The verifier needs your public key in its keyring.
+- Decrypt message takes a whole armored message
+  (`-----BEGIN PGP MESSAGE-----`) encrypted to the card's decryption key,
+  RSA or Curve25519, and returns its session key as `cipher:HEX`. The
+  server does not decrypt the message; decrypt it on your own machine,
+  where no private key is needed:
+
+  ```sh
+  gpg --override-session-key 9:HEX --decrypt message.asc
+  sq decrypt --session-key 9:HEX message.asc
+  ```
+
+  The OpenPGP tab explains this and shows both commands with the key
+  filled in. Sequoia cannot read messages gpg 2.5 encrypts with its own
+  OCB format (`data_format` is `gnupg_ocb`); use gpg for those. The session
+  key opens that one message only; treat it like the message. For
+  Curve25519 keys the key derivation parameters are not stored on the
+  card, so the common ones are tried (gpg's default, SHA-256 and AES-128,
+  first); the key unwrap's integrity check rejects the wrong ones.
 
 The key blocks its PIN after 3 wrong tries. To make sure the API can never
 do that, the service reads the retry counter before every PIN check and
@@ -304,9 +359,30 @@ node --test "static/*.test.js"         # frontend helpers, no npm needed
 python3 -m unittest discover -s ci      # the coverage gate's own tests
 ```
 
+Supply chain (needs `cargo install --locked cargo-deny cargo-audit`).
+`deny.toml` allows crates.io only, permissive licenses only (one MPL-2.0
+exception), and denies every advisory except the ones listed there with a
+reason; `.cargo/audit.toml` lists the same exceptions:
+
+```sh
+cargo deny --locked check
+cargo audit --deny warnings
+```
+
+Fuzzing (needs `cargo install --locked cargo-fuzz` and a nightly toolchain).
+The targets in `fuzz/` feed arbitrary bytes to every parser of card
+responses, to response and command chaining, to OpenPGP message
+building, and to encrypted messages. CI runs each for 60 seconds; run them longer before a release:
+
+```sh
+cargo +nightly fuzz list
+cargo +nightly fuzz run openpgp_responses -- -max_total_time=600
+```
+
 Coverage (needs `cargo install cargo-llvm-cov` and the `llvm-tools-preview`
-rustup component). The gate requires 95% of lines in `oath::*`, `session`, and
-`ratelimit`, and 85% overall; the PC/SC transport and `main.rs` are excluded.
+rustup component). The gate requires 95% of lines in `oath::*`, `openpgp::*`,
+`session`, and `ratelimit`, and 85% overall; the PC/SC transport and
+`main.rs` are excluded.
 
 ```sh
 cargo llvm-cov --locked --no-report
@@ -372,8 +448,11 @@ sh -c 'set -a; . ./.env; set +a; cargo test --features hardware-tests --test har
 5. Unplug and replug the key while the page is open: the page should show
    "YubiKey unavailable" and recover on its own once the key is back.
 6. Confirm the logs contain no password or codes.
-7. With an OpenPGP key on the card: sign through the API and verify with
-   `gpg --verify` or `openssl`; check `/docs` renders.
+7. With an OpenPGP key on the card: sign through the API or the OpenPGP
+   tab and verify the signature with `openssl` against the public key the
+   page shows (the card returns a raw PKCS #1 v1.5 signature, not an
+   OpenPGP signature packet, so `gpg --verify` does not apply); check
+   `/docs` renders.
 
 ## Project notes
 
